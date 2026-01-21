@@ -1,5 +1,5 @@
 [package]
-name = "examples_parameter_demo"
+name = "examples_rclrs_parameter_demo"
 version = "0.5.0"
 edition = "2021"
 
