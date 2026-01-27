@@ -35,7 +35,8 @@ use crate::{
     ExecutorCommands, IntoActionClientOptions, IntoActionServerOptions, IntoAsyncServiceCallback,
     IntoAsyncSubscriptionCallback, IntoNodeServiceCallback, IntoNodeSubscriptionCallback,
     IntoNodeTimerOneshotCallback, IntoNodeTimerRepeatingCallback, IntoTimerOptions, LogParams,
-    Logger, ParameterBuilder, ParameterInterface, ParameterVariant, Parameters, Promise, Publisher,
+    Logger, ParameterBuilder, ParameterCallbackHandle, ParameterInterface, ParameterValue,
+    ParameterVariant, Parameters, Promise, Publisher,
     PublisherOptions, PublisherState, RclrsError, RequestedGoal, Service, ServiceOptions,
     ServiceState, Subscription, SubscriptionOptions, SubscriptionState, TerminatedGoal, TimeSource,
     Timer, TimerState, ToLogParams, Worker, WorkerOptions, WorkerState, ENTITY_LIFECYCLE_MUTEX,
@@ -1246,6 +1247,55 @@ impl NodeState {
         Parameters {
             interface: &self.parameter,
         }
+    }
+
+    /// Add a callback that validates parameter changes before they're applied.
+    ///
+    /// The callback receives the parameter name, old value, and proposed new value.
+    /// Return `Ok(())` to accept the change or `Err(reason)` to reject it.
+    ///
+    /// The callback is automatically unregistered when the returned handle is dropped.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handle = node.add_on_set_parameters_callback(|name, old, new| {
+    ///     if name == "critical_param" {
+    ///         // Custom validation logic
+    ///         if some_condition {
+    ///             return Err("Cannot change critical_param right now".into());
+    ///         }
+    ///     }
+    ///     Ok(())
+    /// });
+    /// // Callback remains active while `handle` is in scope
+    /// ```
+    pub fn add_on_set_parameters_callback<F>(&self, callback: F) -> ParameterCallbackHandle
+    where
+        F: Fn(&str, &ParameterValue, &ParameterValue) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.parameter.add_on_set_parameters_callback(callback)
+    }
+
+    /// Add a callback that is invoked after parameters are successfully changed.
+    ///
+    /// The callback receives the parameter name, old value, and new value.
+    /// This is useful for reacting to parameter changes without blocking them.
+    ///
+    /// The callback is automatically unregistered when the returned handle is dropped.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handle = node.add_post_set_parameters_callback(|name, old, new| {
+    ///     println!("Parameter {} changed from {:?} to {:?}", name, old, new);
+    /// });
+    /// ```
+    pub fn add_post_set_parameters_callback<F>(&self, callback: F) -> ParameterCallbackHandle
+    where
+        F: Fn(&str, &ParameterValue, &ParameterValue) + Send + Sync + 'static,
+    {
+        self.parameter.add_post_set_parameters_callback(callback)
     }
 
     /// Same as [`Self::notify_on_graph_change_with_period`] but uses a

@@ -36,7 +36,8 @@ async-std = "1.13"
 libloading = { version = "0.8", optional = true }
 
 # Needed for the Message trait, among others
-rosidl_runtime_rs = "0.5"
+# Using path dependency to match workspace-installed message crates
+rosidl_runtime_rs = { path = "../../../install/rosidl_runtime_rs/share/rosidl_runtime_rs/rust" }
 
 # Needed for serliazation and deserialization of vendored messages
 serde = { version = "1", optional = true, features = ["derive"] }

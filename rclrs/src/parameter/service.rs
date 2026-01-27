@@ -186,8 +186,28 @@ fn set_parameters(req: SetParameters_Request, map: &mut ParameterMap) -> SetPara
                 };
             };
             match map.validate_parameter_setting(name, param.value) {
-                Ok(value) => {
-                    map.store_parameter(name.into(), value);
+                Ok(new_value) => {
+                    // Get the old value for callbacks
+                    let old_value = map.get_current_value(name);
+
+                    // Run node-level validators
+                    if let Some(ref old) = old_value {
+                        if let Err(e) = map.run_validators(name, old, &new_value) {
+                            return SetParametersResult {
+                                successful: false,
+                                reason: e.to_string().into(),
+                            };
+                        }
+                    }
+
+                    // Store the new value
+                    map.store_parameter(name.into(), new_value.clone());
+
+                    // Notify post-change callbacks
+                    if let Some(old) = old_value {
+                        map.notify_change(name, &old, &new_value);
+                    }
+
                     SetParametersResult {
                         successful: true,
                         reason: Default::default(),
@@ -207,23 +227,45 @@ fn set_parameters_atomically(
     req: SetParametersAtomically_Request,
     map: &mut ParameterMap,
 ) -> SetParametersAtomically_Response {
-    let results = req
+
+    // First pass: validate all parameters and collect old values
+    let validated: Result<Vec<_>, String> = req
         .parameters
         .into_iter()
         .map(|param| {
             let Ok(name) = param.name.to_cstr().to_str() else {
                 return Err("Failed parsing into UTF-8".into());
             };
-            let value = map.validate_parameter_setting(name, param.value)?;
-            Ok((name.into(), value))
+            let new_value = map.validate_parameter_setting(name, param.value)?;
+            let old_value = map.get_current_value(name);
+            Ok((name.to_string(), old_value, new_value))
         })
-        .collect::<Result<Vec<_>, _>>();
-    // Check if there was any error and update parameters accordingly
-    let result = match results {
-        Ok(results) => {
-            for (name, value) in results.into_iter() {
-                map.store_parameter(name, value);
+        .collect();
+
+    let result = match validated {
+        Ok(params) => {
+            // Second pass: run all validators
+            for (name, old_value, new_value) in &params {
+                if let Some(ref old) = old_value {
+                    if let Err(e) = map.run_validators(name, old, new_value) {
+                        return SetParametersAtomically_Response {
+                            result: SetParametersResult {
+                                successful: false,
+                                reason: e.to_string().into(),
+                            },
+                        };
+                    }
+                }
             }
+
+            // Third pass: store all values and notify
+            for (name, old_value, new_value) in params {
+                map.store_parameter(name.clone().into(), new_value.clone());
+                if let Some(old) = old_value {
+                    map.notify_change(&name, &old, &new_value);
+                }
+            }
+
             SetParametersResult {
                 successful: true,
                 reason: Default::default(),
@@ -231,7 +273,7 @@ fn set_parameters_atomically(
         }
         Err(reason) => SetParametersResult {
             successful: false,
-            reason,
+            reason: reason.into(),
         },
     };
     SetParametersAtomically_Response { result }

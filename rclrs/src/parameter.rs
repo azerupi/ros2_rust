@@ -1,8 +1,14 @@
+mod callback;
 mod override_map;
 mod range;
 mod service;
 mod value;
 
+pub use callback::{
+    NodeParameterChangeCallback, NodeParameterValidator, ParameterCallbackHandle,
+    ParameterSubscription,
+};
+pub(crate) use callback::CallbackRegistry;
 pub(crate) use override_map::*;
 pub use range::*;
 use service::*;
@@ -19,6 +25,28 @@ use std::{
     marker::PhantomData,
     sync::{Arc, Mutex, RwLock, Weak},
 };
+use tokio::sync::watch;
+
+/// Callback type for validating parameter changes before they're applied.
+///
+/// The callback receives references to the old and new values, and returns
+/// `Ok(())` to accept the change or `Err(reason)` to reject it.
+///
+/// # Example
+///
+/// ```ignore
+/// node.declare_parameter("speed")
+///     .default(10.0)
+///     .on_validate(|old, new| {
+///         if *new < 0.0 {
+///             Err("Speed cannot be negative".into())
+///         } else {
+///             Ok(())
+///         }
+///     })
+///     .mandatory()
+/// ```
+pub type ParameterValidator<T> = Box<dyn Fn(&T, &T) -> Result<(), String> + Send + Sync>;
 
 // This module implements the core logic of parameters in rclrs.
 // The implementation is fairly different from the existing ROS 2 client libraries. A detailed
@@ -94,9 +122,10 @@ pub struct ParameterBuilder<'a, T: ParameterVariant> {
     discriminator: DiscriminatorFunction<'a, T>,
     options: ParameterOptions<T>,
     interface: &'a ParameterInterface,
+    validator: Option<ParameterValidator<T>>,
 }
 
-impl<'a, T: ParameterVariant> ParameterBuilder<'a, T> {
+impl<'a, T: ParameterVariant + 'static> ParameterBuilder<'a, T> {
     /// Sets the default value for the parameter. The parameter value will be
     /// initialized to this if no command line override was given for this
     /// parameter and if the parameter also had no value prior to being
@@ -162,6 +191,37 @@ impl<'a, T: ParameterVariant> ParameterBuilder<'a, T> {
     /// and can be used by integrators to understand complex constraints.
     pub fn constraints(mut self, constraints: impl Into<Arc<str>>) -> Self {
         self.options.constraints = constraints.into();
+        self
+    }
+
+    /// Register a validation callback that can reject parameter changes.
+    ///
+    /// The callback receives references to the old and new values, and should
+    /// return `Ok(())` to accept the change or `Err(reason)` to reject it.
+    ///
+    /// This callback will be invoked whenever the parameter value is changed,
+    /// either programmatically via [`MandatoryParameter::set()`] or via the
+    /// ROS 2 parameter services.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let speed = node.declare_parameter("max_speed")
+    ///     .default(10.0)
+    ///     .on_validate(|old, new| {
+    ///         if *new < *old * 0.5 {
+    ///             Err("Cannot reduce speed by more than 50%".into())
+    ///         } else {
+    ///             Ok(())
+    ///         }
+    ///     })
+    ///     .mandatory()?;
+    /// ```
+    pub fn on_validate<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&T, &T) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.validator = Some(Box::new(f));
         self
     }
 
@@ -259,7 +319,7 @@ pub fn default_initial_value_discriminator<T: ParameterVariant>(
 
 type DiscriminatorFunction<'a, T> = Box<dyn FnOnce(AvailableValues<T>) -> Option<T> + 'a>;
 
-impl<T: ParameterVariant> TryFrom<ParameterBuilder<'_, T>> for OptionalParameter<T> {
+impl<T: ParameterVariant + 'static> TryFrom<ParameterBuilder<'_, T>> for OptionalParameter<T> {
     type Error = DeclarationError;
 
     fn try_from(builder: ParameterBuilder<T>) -> Result<Self, Self::Error> {
@@ -273,17 +333,38 @@ impl<T: ParameterVariant> TryFrom<ParameterBuilder<'_, T>> for OptionalParameter
             &ranges,
         )?;
         let value = Arc::new(RwLock::new(initial_value.map(|v| v.into())));
+        let (change_tx, _) = watch::channel(());
+
+        // Convert typed validator to type-erased StoredValidator
+        let stored_validator: Option<StoredValidator> =
+            builder.validator.map(|typed_validator| {
+                Arc::new(move |old: &ParameterValue, new: &ParameterValue| {
+                    let old_typed: T = old
+                        .clone()
+                        .try_into()
+                        .map_err(|_| "Type conversion failed for old value")?;
+                    let new_typed: T = new
+                        .clone()
+                        .try_into()
+                        .map_err(|_| "Type conversion failed for new value")?;
+                    typed_validator(&old_typed, &new_typed)
+                }) as StoredValidator
+            });
+
         builder.interface.store_parameter(
             builder.name.clone(),
             T::kind(),
             DeclaredValue::Optional(value.clone()),
             builder.options.into(),
+            stored_validator,
+            Some(change_tx.clone()),
         );
         Ok(OptionalParameter {
             name: builder.name,
             value,
             ranges,
             map: Arc::downgrade(&builder.interface.parameter_map),
+            change_tx,
             _marker: Default::default(),
         })
     }
@@ -297,6 +378,7 @@ pub struct MandatoryParameter<T: ParameterVariant> {
     value: Arc<RwLock<ParameterValue>>,
     ranges: ParameterRanges,
     map: Weak<Mutex<ParameterMap>>,
+    change_tx: watch::Sender<()>,
     _marker: PhantomData<T>,
 }
 
@@ -320,7 +402,7 @@ impl<T: ParameterVariant> Drop for MandatoryParameter<T> {
     }
 }
 
-impl<'a, T: ParameterVariant + 'a> TryFrom<ParameterBuilder<'a, T>> for MandatoryParameter<T> {
+impl<T: ParameterVariant + 'static> TryFrom<ParameterBuilder<'_, T>> for MandatoryParameter<T> {
     type Error = DeclarationError;
 
     fn try_from(builder: ParameterBuilder<T>) -> Result<Self, Self::Error> {
@@ -337,17 +419,38 @@ impl<'a, T: ParameterVariant + 'a> TryFrom<ParameterBuilder<'a, T>> for Mandator
             return Err(DeclarationError::NoValueAvailable);
         };
         let value = Arc::new(RwLock::new(initial_value.into()));
+        let (change_tx, _) = watch::channel(());
+
+        // Convert typed validator to type-erased StoredValidator
+        let stored_validator: Option<StoredValidator> =
+            builder.validator.map(|typed_validator| {
+                Arc::new(move |old: &ParameterValue, new: &ParameterValue| {
+                    let old_typed: T = old
+                        .clone()
+                        .try_into()
+                        .map_err(|_| "Type conversion failed for old value")?;
+                    let new_typed: T = new
+                        .clone()
+                        .try_into()
+                        .map_err(|_| "Type conversion failed for new value")?;
+                    typed_validator(&old_typed, &new_typed)
+                }) as StoredValidator
+            });
+
         builder.interface.store_parameter(
             builder.name.clone(),
             T::kind(),
             DeclaredValue::Mandatory(value.clone()),
             builder.options.into(),
+            stored_validator,
+            Some(change_tx.clone()),
         );
         Ok(MandatoryParameter {
             name: builder.name,
             value,
             ranges,
             map: Arc::downgrade(&builder.interface.parameter_map),
+            change_tx,
             _marker: Default::default(),
         })
     }
@@ -361,6 +464,7 @@ pub struct OptionalParameter<T: ParameterVariant> {
     value: Arc<RwLock<Option<ParameterValue>>>,
     ranges: ParameterRanges,
     map: Weak<Mutex<ParameterMap>>,
+    change_tx: watch::Sender<()>,
     _marker: PhantomData<T>,
 }
 
@@ -413,7 +517,7 @@ impl<T: ParameterVariant> Drop for ReadOnlyParameter<T> {
     }
 }
 
-impl<'a, T: ParameterVariant + 'a> TryFrom<ParameterBuilder<'a, T>> for ReadOnlyParameter<T> {
+impl<T: ParameterVariant + 'static> TryFrom<ParameterBuilder<'_, T>> for ReadOnlyParameter<T> {
     type Error = DeclarationError;
 
     fn try_from(builder: ParameterBuilder<T>) -> Result<Self, Self::Error> {
@@ -435,6 +539,8 @@ impl<'a, T: ParameterVariant + 'a> TryFrom<ParameterBuilder<'a, T>> for ReadOnly
             T::kind(),
             DeclaredValue::ReadOnly(value.clone()),
             builder.options.into(),
+            None, // ReadOnly parameters don't need validators
+            None, // ReadOnly parameters don't need change notifications
         );
         Ok(ReadOnlyParameter {
             name: builder.name,
@@ -445,11 +551,43 @@ impl<'a, T: ParameterVariant + 'a> TryFrom<ParameterBuilder<'a, T>> for ReadOnly
     }
 }
 
-#[derive(Clone, Debug)]
+/// Type-erased validator that works with ParameterValue.
+/// This is stored in DeclaredStorage so the parameter service can invoke it.
+pub(crate) type StoredValidator =
+    Arc<dyn Fn(&ParameterValue, &ParameterValue) -> Result<(), String> + Send + Sync>;
+
 struct DeclaredStorage {
     value: DeclaredValue,
     kind: ParameterKind,
     options: ParameterOptionsStorage,
+    /// Optional validator that is called before setting a new value
+    validator: Option<StoredValidator>,
+    /// Channel to notify per-parameter async subscribers
+    change_tx: Option<watch::Sender<()>>,
+}
+
+impl Clone for DeclaredStorage {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+            kind: self.kind.clone(),
+            options: self.options.clone(),
+            validator: self.validator.clone(),
+            change_tx: self.change_tx.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for DeclaredStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeclaredStorage")
+            .field("value", &self.value)
+            .field("kind", &self.kind)
+            .field("options", &self.options)
+            .field("validator", &self.validator.as_ref().map(|_| "<validator>"))
+            .field("change_tx", &self.change_tx.as_ref().map(|_| "<sender>"))
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -490,10 +628,21 @@ impl ParameterStorage {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ParameterMap {
     storage: BTreeMap<Arc<str>, ParameterStorage>,
     allow_undeclared: bool,
+    callback_registry: Arc<Mutex<CallbackRegistry>>,
+}
+
+impl Default for ParameterMap {
+    fn default() -> Self {
+        Self {
+            storage: BTreeMap::new(),
+            allow_undeclared: false,
+            callback_registry: Arc::new(Mutex::new(CallbackRegistry::new())),
+        }
+    }
 }
 
 impl ParameterMap {
@@ -538,15 +687,21 @@ impl ParameterMap {
         Ok(value)
     }
 
-    /// Stores the requested parameter in the map.
+    /// Stores the requested parameter in the map and notifies per-parameter subscribers.
     fn store_parameter(&mut self, name: Arc<str>, value: ParameterValue) {
         match self.storage.entry(name) {
             Entry::Occupied(mut entry) => match entry.get_mut() {
-                ParameterStorage::Declared(storage) => match &storage.value {
-                    DeclaredValue::Mandatory(p) => *p.write().unwrap() = value,
-                    DeclaredValue::Optional(p) => *p.write().unwrap() = Some(value),
-                    DeclaredValue::ReadOnly(_) => unreachable!(),
-                },
+                ParameterStorage::Declared(storage) => {
+                    match &storage.value {
+                        DeclaredValue::Mandatory(p) => *p.write().unwrap() = value,
+                        DeclaredValue::Optional(p) => *p.write().unwrap() = Some(value),
+                        DeclaredValue::ReadOnly(_) => unreachable!(),
+                    }
+                    // Notify per-parameter async subscribers
+                    if let Some(ref tx) = storage.change_tx {
+                        let _ = tx.send(());
+                    }
+                }
                 ParameterStorage::Undeclared(param) => {
                     *param = value;
                 }
@@ -556,6 +711,63 @@ impl ParameterMap {
             }
         }
     }
+
+    /// Run all registered validators (both per-parameter and node-level).
+    ///
+    /// Returns an error if any validator rejects the change.
+    pub(crate) fn run_validators(
+        &self,
+        name: &str,
+        old_value: &ParameterValue,
+        new_value: &ParameterValue,
+    ) -> Result<(), ParameterValueError> {
+        // First, run the per-parameter validator if one exists
+        if let Some(storage) = self.storage.get(name) {
+            if let ParameterStorage::Declared(declared) = storage {
+                if let Some(ref validator) = declared.validator {
+                    validator(old_value, new_value)
+                        .map_err(ParameterValueError::ValidationFailed)?;
+                }
+            }
+        }
+
+        // Then run node-level validators
+        self.callback_registry
+            .lock()
+            .unwrap()
+            .run_validators(name, old_value, new_value)
+            .map_err(ParameterValueError::ValidationFailed)
+    }
+
+    /// Notify all registered post-change callbacks.
+    pub(crate) fn notify_change(
+        &self,
+        name: &str,
+        old_value: &ParameterValue,
+        new_value: &ParameterValue,
+    ) {
+        self.callback_registry
+            .lock()
+            .unwrap()
+            .notify_change(name, old_value, new_value);
+    }
+
+    /// Get a clone of the callback registry for registering node-level callbacks.
+    pub(crate) fn callback_registry(&self) -> Arc<Mutex<CallbackRegistry>> {
+        Arc::clone(&self.callback_registry)
+    }
+
+    /// Get the current value of a parameter, if it exists.
+    pub(crate) fn get_current_value(&self, name: &str) -> Option<ParameterValue> {
+        self.storage.get(name).and_then(|storage| match storage {
+            ParameterStorage::Declared(s) => match &s.value {
+                DeclaredValue::Mandatory(v) => Some(v.read().unwrap().clone()),
+                DeclaredValue::Optional(v) => v.read().unwrap().clone(),
+                DeclaredValue::ReadOnly(v) => Some(v.clone()),
+            },
+            ParameterStorage::Undeclared(v) => Some(v.clone()),
+        })
+    }
 }
 
 impl<T: ParameterVariant> MandatoryParameter<T> {
@@ -564,15 +776,69 @@ impl<T: ParameterVariant> MandatoryParameter<T> {
         self.value.read().unwrap().clone().try_into().ok().unwrap()
     }
 
+    /// Returns the name of this parameter.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Sets the parameter value.
-    /// Returns [`ParameterValueError::OutOfRange`] if the value is out of the parameter's range.
+    ///
+    /// Returns an error if:
+    /// - The value is out of the parameter's range ([`ParameterValueError::OutOfRange`])
+    /// - A validation callback rejects the change ([`ParameterValueError::ValidationFailed`])
     pub fn set<U: Into<T>>(&self, value: U) -> Result<(), ParameterValueError> {
-        let value = value.into().into();
-        if !self.ranges.in_range(&value) {
+        let new_value = value.into();
+        let param_value = new_value.clone().into();
+
+        // 1. Range check
+        if !self.ranges.in_range(&param_value) {
             return Err(ParameterValueError::OutOfRange);
         }
-        *self.value.write().unwrap() = value;
+
+        let old_value = self.get();
+
+        // 2. Run validators (per-parameter + node-level, via ParameterMap)
+        if let Some(map) = self.map.upgrade() {
+            map.lock()
+                .unwrap()
+                .run_validators(&self.name, &old_value.clone().into(), &param_value)?;
+        }
+
+        // 3. Apply change
+        *self.value.write().unwrap() = param_value.clone();
+
+        // 4. Notify node-level post-change callbacks
+        if let Some(map) = self.map.upgrade() {
+            map.lock()
+                .unwrap()
+                .notify_change(&self.name, &old_value.into(), &param_value);
+        }
+
+        // 5. Notify per-parameter subscribers (non-blocking)
+        let _ = self.change_tx.send(());
+
         Ok(())
+    }
+
+    /// Subscribe to parameter changes.
+    ///
+    /// Returns a [`ParameterSubscription`] that can be used to asynchronously
+    /// wait for parameter changes.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut subscription = param.subscribe();
+    /// while let Some(new_value) = subscription.changed().await {
+    ///     println!("Parameter changed to: {:?}", new_value);
+    /// }
+    /// ```
+    pub fn subscribe(&self) -> ParameterSubscription<T> {
+        let value = Arc::clone(&self.value);
+        let get_value: Arc<dyn Fn() -> T + Send + Sync> = Arc::new(move || {
+            value.read().unwrap().clone().try_into().ok().unwrap()
+        });
+        ParameterSubscription::new(self.change_tx.subscribe(), get_value)
     }
 }
 
@@ -593,20 +859,98 @@ impl<T: ParameterVariant> OptionalParameter<T> {
             .map(|p| p.try_into().ok().unwrap())
     }
 
+    /// Returns the name of this parameter.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Assigns a value to the optional parameter, setting it to `Some(value)`.
-    /// Returns [`ParameterValueError::OutOfRange`] if the value is out of the parameter's range.
+    ///
+    /// Returns an error if:
+    /// - The value is out of the parameter's range ([`ParameterValueError::OutOfRange`])
+    /// - A validation callback rejects the change ([`ParameterValueError::ValidationFailed`])
     pub fn set<U: Into<T>>(&self, value: U) -> Result<(), ParameterValueError> {
-        let value = value.into().into();
-        if !self.ranges.in_range(&value) {
+        let new_value = value.into();
+        let param_value = new_value.clone().into();
+
+        // 1. Range check
+        if !self.ranges.in_range(&param_value) {
             return Err(ParameterValueError::OutOfRange);
         }
-        *self.value.write().unwrap() = Some(value);
+
+        // Get old value for validators (None becomes a sentinel value)
+        let old_param_value = self.value.read().unwrap().clone();
+
+        // 2. Run validators (per-parameter + node-level, via ParameterMap)
+        if let Some(map) = self.map.upgrade() {
+            let old_for_validator = old_param_value
+                .clone()
+                .unwrap_or_else(|| ParameterValue::Bool(false)); // Placeholder for unset
+            map.lock()
+                .unwrap()
+                .run_validators(&self.name, &old_for_validator, &param_value)?;
+        }
+
+        // 3. Apply change
+        *self.value.write().unwrap() = Some(param_value.clone());
+
+        // 4. Notify node-level post-change callbacks
+        if let Some(map) = self.map.upgrade() {
+            let old_for_callback = old_param_value
+                .unwrap_or_else(|| ParameterValue::Bool(false)); // Placeholder for unset
+            map.lock()
+                .unwrap()
+                .notify_change(&self.name, &old_for_callback, &param_value);
+        }
+
+        // 5. Notify per-parameter subscribers
+        let _ = self.change_tx.send(());
+
         Ok(())
     }
 
     /// Unsets the optional parameter value to `None`.
     pub fn unset(&self) {
+        let old_value = self.value.read().unwrap().clone();
         *self.value.write().unwrap() = None;
+
+        // Notify node-level post-change callbacks
+        if let Some(map) = self.map.upgrade() {
+            if let Some(old) = old_value {
+                // Use a placeholder for the "new" value since it's being unset
+                map.lock()
+                    .unwrap()
+                    .notify_change(&self.name, &old, &ParameterValue::Bool(false));
+            }
+        }
+
+        // Notify per-parameter subscribers
+        let _ = self.change_tx.send(());
+    }
+
+    /// Subscribe to parameter changes.
+    ///
+    /// Returns a [`ParameterSubscription`] that can be used to asynchronously
+    /// wait for parameter changes.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut subscription = param.subscribe();
+    /// while let Some(new_value) = subscription.changed().await {
+    ///     println!("Parameter changed to: {:?}", new_value);
+    /// }
+    /// ```
+    pub fn subscribe(&self) -> ParameterSubscription<Option<T>> {
+        let value = Arc::clone(&self.value);
+        let get_value: Arc<dyn Fn() -> Option<T> + Send + Sync> = Arc::new(move || {
+            value
+                .read()
+                .unwrap()
+                .clone()
+                .map(|p| p.try_into().ok().unwrap())
+        });
+        ParameterSubscription::new(self.change_tx.subscribe(), get_value)
     }
 }
 
@@ -624,6 +968,8 @@ pub enum ParameterValueError {
     TypeMismatch,
     /// A write on a read-only parameter was attempted.
     ReadOnly,
+    /// A validation callback rejected the parameter change.
+    ValidationFailed(String),
 }
 
 impl std::fmt::Display for ParameterValueError {
@@ -632,6 +978,7 @@ impl std::fmt::Display for ParameterValueError {
             ParameterValueError::OutOfRange => write!(f, "parameter value was out of the parameter's range"),
             ParameterValueError::TypeMismatch => write!(f, "parameter was stored in a static type and an operation on a different type was attempted"),
             ParameterValueError::ReadOnly => write!(f, "a write on a read-only parameter was attempted"),
+            ParameterValueError::ValidationFailed(reason) => write!(f, "parameter validation failed: {}", reason),
         }
     }
 }
@@ -786,6 +1133,7 @@ impl ParameterInterface {
             discriminator: Box::new(default_initial_value_discriminator::<T>),
             options: Default::default(),
             interface: self,
+            validator: None,
         }
     }
 
@@ -855,6 +1203,8 @@ impl ParameterInterface {
         kind: ParameterKind,
         value: DeclaredValue,
         options: ParameterOptionsStorage,
+        validator: Option<StoredValidator>,
+        change_tx: Option<watch::Sender<()>>,
     ) {
         self.parameter_map.lock().unwrap().storage.insert(
             name,
@@ -862,12 +1212,38 @@ impl ParameterInterface {
                 options,
                 value,
                 kind,
+                validator,
+                change_tx,
             }),
         );
     }
 
     pub(crate) fn allow_undeclared(&self) {
         self.parameter_map.lock().unwrap().allow_undeclared = true;
+    }
+
+    /// Add a node-level validator callback.
+    ///
+    /// The callback will be invoked when any parameter is changed and can reject the change.
+    pub(crate) fn add_on_set_parameters_callback<F>(&self, callback: F) -> ParameterCallbackHandle
+    where
+        F: Fn(&str, &ParameterValue, &ParameterValue) -> Result<(), String> + Send + Sync + 'static,
+    {
+        let registry = self.parameter_map.lock().unwrap().callback_registry();
+        let id = registry.lock().unwrap().add_validator(Box::new(callback));
+        CallbackRegistry::create_handle(&registry, id)
+    }
+
+    /// Add a node-level post-change callback.
+    ///
+    /// The callback will be invoked after any parameter is successfully changed.
+    pub(crate) fn add_post_set_parameters_callback<F>(&self, callback: F) -> ParameterCallbackHandle
+    where
+        F: Fn(&str, &ParameterValue, &ParameterValue) + Send + Sync + 'static,
+    {
+        let registry = self.parameter_map.lock().unwrap().callback_registry();
+        let id = registry.lock().unwrap().add_post_change(Box::new(callback));
+        CallbackRegistry::create_handle(&registry, id)
     }
 }
 
@@ -1409,5 +1785,169 @@ mod tests {
         node.declare_parameter::<i64>("int_param")
             .optional()
             .unwrap();
+    }
+
+    #[test]
+    fn test_parameter_validator_accepts() {
+        let node = Context::default()
+            .create_basic_executor()
+            .create_node(&format!("param_test_node_{}", line!()))
+            .unwrap();
+
+        let param = node
+            .declare_parameter("validated_param")
+            .default(10.0)
+            .on_validate(|_old, new| {
+                if *new >= 0.0 {
+                    Ok(())
+                } else {
+                    Err("Value must be non-negative".into())
+                }
+            })
+            .mandatory()
+            .unwrap();
+
+        // Valid value should be accepted
+        assert!(param.set(20.0).is_ok());
+        assert_eq!(param.get(), 20.0);
+    }
+
+    #[test]
+    fn test_parameter_validator_rejects() {
+        let node = Context::default()
+            .create_basic_executor()
+            .create_node(&format!("param_test_node_{}", line!()))
+            .unwrap();
+
+        let param = node
+            .declare_parameter("validated_param")
+            .default(10.0)
+            .on_validate(|_old, new| {
+                if *new >= 0.0 {
+                    Ok(())
+                } else {
+                    Err("Value must be non-negative".into())
+                }
+            })
+            .mandatory()
+            .unwrap();
+
+        // Invalid value should be rejected
+        let result = param.set(-5.0);
+        assert!(matches!(result, Err(ParameterValueError::ValidationFailed(_))));
+
+        // Value should not have changed
+        assert_eq!(param.get(), 10.0);
+    }
+
+    #[test]
+    fn test_node_level_validator() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let node = Context::default()
+            .create_basic_executor()
+            .create_node(&format!("param_test_node_{}", line!()))
+            .unwrap();
+
+        let validator_called = Arc::new(AtomicBool::new(false));
+        let validator_called_clone = validator_called.clone();
+
+        // Register a node-level validator
+        let _handle = node.add_on_set_parameters_callback(move |name, _old, new| {
+            validator_called_clone.store(true, Ordering::SeqCst);
+            if name == "blocked_param" {
+                Err("This parameter cannot be changed".into())
+            } else {
+                Ok(())
+            }
+        });
+
+        // Create parameters
+        let allowed_param = node
+            .declare_parameter("allowed_param")
+            .default(1)
+            .mandatory()
+            .unwrap();
+
+        let blocked_param = node
+            .declare_parameter("blocked_param")
+            .default(1)
+            .mandatory()
+            .unwrap();
+
+        // Allowed parameter should work
+        assert!(allowed_param.set(2).is_ok());
+        assert!(validator_called.load(Ordering::SeqCst));
+
+        // Blocked parameter should fail
+        validator_called.store(false, Ordering::SeqCst);
+        let result = blocked_param.set(2);
+        assert!(matches!(result, Err(ParameterValueError::ValidationFailed(_))));
+        assert!(validator_called.load(Ordering::SeqCst));
+        assert_eq!(blocked_param.get(), 1); // Value unchanged
+    }
+
+    #[test]
+    fn test_node_level_post_change_callback() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let node = Context::default()
+            .create_basic_executor()
+            .create_node(&format!("param_test_node_{}", line!()))
+            .unwrap();
+
+        let callback_count = Arc::new(AtomicI64::new(0));
+        let callback_count_clone = callback_count.clone();
+
+        // Register a post-change callback
+        let _handle = node.add_post_set_parameters_callback(move |_name, _old, _new| {
+            callback_count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let param = node
+            .declare_parameter("test_param")
+            .default(1)
+            .mandatory()
+            .unwrap();
+
+        // Change parameter multiple times
+        param.set(2).unwrap();
+        param.set(3).unwrap();
+        param.set(4).unwrap();
+
+        // Callback should have been called 3 times
+        assert_eq!(callback_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_callback_handle_drop_unregisters() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let node = Context::default()
+            .create_basic_executor()
+            .create_node(&format!("param_test_node_{}", line!()))
+            .unwrap();
+
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_called_clone = callback_called.clone();
+
+        let param = node
+            .declare_parameter("test_param")
+            .default(1)
+            .mandatory()
+            .unwrap();
+
+        // Register and immediately drop the handle
+        {
+            let _handle = node.add_post_set_parameters_callback(move |_name, _old, _new| {
+                callback_called_clone.store(true, Ordering::SeqCst);
+            });
+            // Handle is dropped here
+        }
+
+        // Change parameter - callback should NOT be called because handle was dropped
+        callback_called.store(false, Ordering::SeqCst);
+        param.set(2).unwrap();
+        assert!(!callback_called.load(Ordering::SeqCst));
     }
 }
