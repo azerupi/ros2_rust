@@ -6,6 +6,8 @@ authors = ["Sam Privett <sam@privett.dev>"]
 license = "Apache-2.0"
 description = "Top-level Rust crate to include generated Rust code found in a sourced ROS 2 workspace"
 rust-version = "1.85"
+repository = "https://github.com/ros2-rust/ros-env"
+keywords = ["ROS", "ROS2", "robotics"]
 
 [dependencies]
 # All the sources we `include!()` depend on this runtime.
