@@ -12,7 +12,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{channel, Receiver, Sender},
-        Arc, Mutex, Weak,
+        Arc, Mutex,
     },
     task::Context as TaskContext,
     time::Instant,
@@ -20,9 +20,11 @@ use std::{
 
 use crate::{
     log_debug, log_fatal, log_warn, ExecutorChannel, ExecutorRuntime, ExecutorWorkerOptions,
-    GuardCondition, PayloadTask, RclrsError, SpinConditions, WaitSetRunConditions, WaitSetRunner,
-    Waitable, WeakActivityListener, WorkerChannel,
+    PayloadTask, RclrsError, SpinConditions, WaitSetRunConditions, WaitSetRunner, Waitable,
+    WeakActivityListener, WorkerChannel,
 };
+
+use super::guard_conditions::AllGuardConditions;
 
 static FAILED_TO_SEND_WORKER: &'static str =
     "Failed to send the new runner. This should never happen. \
@@ -48,45 +50,6 @@ pub struct BasicExecutorRuntime {
     all_guard_conditions: AllGuardConditions,
     new_worker_receiver: Option<StreamFuture<UnboundedReceiver<WaitSetRunner>>>,
     new_worker_sender: UnboundedSender<WaitSetRunner>,
-}
-
-#[derive(Clone, Default)]
-struct AllGuardConditions {
-    inner: Arc<Mutex<Vec<Weak<GuardCondition>>>>,
-}
-
-impl AllGuardConditions {
-    fn trigger(&self) {
-        self.inner.lock().unwrap().retain(|guard_condition| {
-            if let Some(guard_condition) = guard_condition.upgrade() {
-                if let Err(err) = guard_condition.trigger() {
-                    log_fatal!(
-                        "rclrs.executor.basic_executor",
-                        "Failed to trigger a guard condition. This should never happen. \
-                        Please report this to the rclrs maintainers with a minimal reproducible example. \
-                        Error: {err}",
-                    );
-                }
-                true
-            } else {
-                false
-            }
-        });
-    }
-
-    fn push(&self, guard_condition: Weak<GuardCondition>) {
-        let mut inner = self.inner.lock().unwrap();
-        if inner
-            .iter()
-            .find(|other| guard_condition.ptr_eq(other))
-            .is_some()
-        {
-            // This guard condition is already known
-            return;
-        }
-
-        inner.push(guard_condition);
-    }
 }
 
 impl ExecutorRuntime for BasicExecutorRuntime {
