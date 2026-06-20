@@ -383,6 +383,60 @@ impl ArcWake for Task {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use crate::*;
+    use std::time::Duration;
+
+    /// The worker thread a `WaitSetRunner` spawns must be joined when the
+    /// executor is dropped, not leaked. Counts the named `rclrs-worker` threads
+    /// (Linux only) before, during, and after an executor's lifetime.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_thread_is_joined_on_drop() {
+        fn rclrs_worker_threads() -> usize {
+            let mut count = 0;
+            if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+                for entry in entries.flatten() {
+                    if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
+                        if comm.trim() == "rclrs-worker" {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            count
+        }
+
+        let before = rclrs_worker_threads();
+        {
+            let mut executor = Context::default().create_basic_executor();
+            let _node = executor.create_node("worker_thread_lifecycle").unwrap();
+            // Creating the executor's default worker must have spawned a worker
+            // thread, and spinning must reuse it (not spawn more).
+            assert!(
+                rclrs_worker_threads() > before,
+                "creating an executor did not spawn a reusable worker thread",
+            );
+            let during = rclrs_worker_threads();
+            for _ in 0..5 {
+                executor.spin(SpinOptions::new().timeout(Duration::ZERO));
+            }
+            assert_eq!(
+                rclrs_worker_threads(),
+                during,
+                "spinning spawned additional worker threads instead of reusing one",
+            );
+            // executor drops here -> WaitSetRunner::drop joins the worker thread.
+        }
+        assert_eq!(
+            rclrs_worker_threads(),
+            before,
+            "worker thread was leaked after the executor was dropped",
+        );
+    }
+}
+
 async fn manage_workers(
     mut new_workers: StreamFuture<UnboundedReceiver<WaitSetRunner>>,
     all_guard_conditions: AllGuardConditions,
@@ -392,7 +446,7 @@ async fn manage_workers(
     StreamFuture<UnboundedReceiver<WaitSetRunner>>,
     Vec<RclrsError>,
 ) {
-    let mut active_runners: Vec<oneshot::Receiver<(WaitSetRunner, Result<(), RclrsError>)>> =
+    let mut active_runners: Vec<BoxFuture<'static, (WaitSetRunner, Result<(), RclrsError>)>> =
         Vec::new();
     let mut finished_runners: Vec<WaitSetRunner> = Vec::new();
     let mut errors: Vec<RclrsError> = Vec::new();
@@ -420,21 +474,10 @@ async fn manage_workers(
 
         match next_event.await {
             Either::Left(((finished_worker, _, remaining_workers), new_worker_stream)) => {
-                match finished_worker {
-                    Ok((runner, result)) => {
-                        finished_runners.push(runner);
-                        if let Err(err) = result {
-                            errors.push(err);
-                        }
-                    }
-                    Err(_) => {
-                        log_fatal!(
-                            "rclrs.basic_executor",
-                            "WaitSetRunner unexpectedly dropped. This should never happen. \
-                            Please report this to the rclrs maintainers with a minimal \
-                            reproducible example.",
-                        );
-                    }
+                let (runner, result) = finished_worker;
+                finished_runners.push(runner);
+                if let Err(err) = result {
+                    errors.push(err);
                 }
 
                 active_runners = remaining_workers;
