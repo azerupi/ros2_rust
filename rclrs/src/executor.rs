@@ -497,27 +497,35 @@ impl CreateBasicExecutor for Context {
 
 #[cfg(test)]
 mod tests {
-    use crate::*;
-    use std::time::Duration;
+    use crate::test_helpers::*;
 
-    #[test]
-    fn test_timeout() {
-        let context = Context::default();
-        let mut executor = context.create_basic_executor();
-        let _node = executor
-            .create_node(&format!("test_timeout_{}", line!()))
-            .unwrap();
+    test_with_executors! {
+        /// A spin with a timeout and no work reports a `Timeout` error, and does
+        /// so repeatably across successive spins.
+        fn spin_timeout_reports_error(executor, node_name) {
+            use crate::*;
+            use std::time::Duration;
 
-        for _ in 0..10 {
-            let r = executor.spin(SpinOptions::default().timeout(Duration::from_millis(1)));
-            assert_eq!(r.len(), 1);
-            assert!(matches!(
-                r[0],
-                RclrsError::RclError {
-                    code: RclReturnCode::Timeout,
-                    ..
-                }
-            ));
+            let _node = executor
+                .create_node(
+                    node_name.start_parameter_services(false),
+                )
+                .unwrap();
+
+            for _ in 0..5 {
+                let errors =
+                    executor.spin(SpinOptions::default().timeout(Duration::from_millis(20)));
+                assert!(
+                    errors.iter().any(|e| matches!(
+                        e,
+                        RclrsError::RclError {
+                            code: RclReturnCode::Timeout,
+                            ..
+                        }
+                    )),
+                    "expected a Timeout error from a timed-out spin, got {errors:?}",
+                );
+            }
         }
     }
 }

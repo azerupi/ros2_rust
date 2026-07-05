@@ -594,10 +594,10 @@ unsafe impl Send for rcl_timer_t {}
 #[cfg(test)]
 mod tests {
     use super::TimerExecutable;
-    use crate::*;
+    use crate::{test_helpers::test_with_executors, *};
     use std::{
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
         thread,
@@ -610,6 +610,219 @@ mod tests {
 
         assert_send::<TimerState<Node>>();
         assert_sync::<TimerState<Node>>();
+    }
+
+    test_with_executors! {
+        fn timer_repeating_fires_while_spinning(executor, node_name) {
+            let node = executor
+                .create_node(
+                    node_name.start_parameter_services(false),
+                )
+                .unwrap();
+
+            let count = Arc::new(AtomicUsize::new(0));
+            let count_cb = Arc::clone(&count);
+            let _timer = node
+                .create_timer_repeating(Duration::from_millis(10), move || {
+                    count_cb.fetch_add(1, Ordering::Relaxed);
+                })
+                .unwrap();
+
+            executor.spin(SpinOptions::new().timeout(Duration::from_millis(300)));
+
+            // ~30 fires are expected in 300ms; assert a loose lower bound so the
+            // test is robust under load on both executors.
+            let fired = count.load(Ordering::Relaxed);
+            assert!(fired >= 25, "repeating timer fired only {fired} times in ~300ms");
+        }
+    }
+
+    test_with_executors! {
+        /// A one-shot timer fires exactly once no matter how long we spin.
+        fn timer_oneshot_fires_once(executor, node_name) {
+            let node = executor
+                .create_node(
+                    node_name.start_parameter_services(false),
+                )
+                .unwrap();
+
+            let count = Arc::new(AtomicUsize::new(0));
+            let count_cb = Arc::clone(&count);
+            let _timer = node
+                .create_timer_oneshot(Duration::from_millis(10), move || {
+                    count_cb.fetch_add(1, Ordering::Relaxed);
+                })
+                .unwrap();
+
+            executor.spin(SpinOptions::new().timeout(Duration::from_millis(300)));
+
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                1,
+                "one-shot timer should fire exactly once",
+            );
+        }
+    }
+
+    test_with_executors! {
+        /// Cancelling a repeating timer stops its callback from firing again.
+        fn timer_cancel_stops_firing(executor, node_name) {
+            let node = executor
+                .create_node(
+                    node_name.start_parameter_services(false),
+                )
+                .unwrap();
+
+            let count = Arc::new(AtomicUsize::new(0));
+            let count_cb = Arc::clone(&count);
+            let timer = node
+                .create_timer_repeating(Duration::from_millis(10), move || {
+                    count_cb.fetch_add(1, Ordering::Relaxed);
+                })
+                .unwrap();
+
+            // Let it fire a few times, then cancel.
+            executor.spin(SpinOptions::new().timeout(Duration::from_millis(150)));
+            timer.cancel().unwrap();
+
+            // Let any in-flight tick settle, then take a baseline.
+            executor.spin(SpinOptions::new().timeout(Duration::from_millis(50)));
+            let after_cancel = count.load(Ordering::Relaxed);
+            assert!(after_cancel > 0, "timer never fired before cancellation");
+
+            // Spin well past several periods; the count must not grow.
+            executor.spin(SpinOptions::new().timeout(Duration::from_millis(200)));
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                after_cancel,
+                "cancelled timer kept firing",
+            );
+        }
+    }
+
+    test_with_executors! {
+        /// Two timers at different rates both fire, and the faster one outpaces
+        /// the slower one (exercises multiple concurrent timers per executor).
+        fn timer_multi_rate(executor, node_name) {
+            let node = executor
+                .create_node(
+                    node_name.start_parameter_services(false),
+                )
+                .unwrap();
+
+            let fast = Arc::new(AtomicUsize::new(0));
+            let slow = Arc::new(AtomicUsize::new(0));
+            let fast_cb = Arc::clone(&fast);
+            let slow_cb = Arc::clone(&slow);
+
+            let _t_fast = node
+                .create_timer_repeating(Duration::from_millis(5), move || {
+                    fast_cb.fetch_add(1, Ordering::Relaxed);
+                })
+                .unwrap();
+            let _t_slow = node
+                .create_timer_repeating(Duration::from_millis(20), move || {
+                    slow_cb.fetch_add(1, Ordering::Relaxed);
+                })
+                .unwrap();
+
+            executor.spin(SpinOptions::new().timeout(Duration::from_millis(500)));
+
+            // ~100 fast / ~25 slow expected; loose bounds for robustness under load.
+            let fast_fired = fast.load(Ordering::Relaxed);
+            let slow_fired = slow.load(Ordering::Relaxed);
+            assert!(fast_fired >= 90, "fast timer fired only {fast_fired} times in ~500ms");
+            assert!(slow_fired >= 20, "slow timer fired only {slow_fired} times in ~500ms");
+            assert!(
+                fast_fired > slow_fired * 2,
+                "fast timer ({fast_fired}) did not outpace slow ({slow_fired})",
+            );
+        }
+    }
+
+    test_with_executors! {
+        /// `reset()` after `cancel()` makes a repeating timer fire again.
+        fn timer_reset_resumes_firing(executor, node_name) {
+            let node = executor
+                .create_node(
+                    node_name.start_parameter_services(false),
+                )
+                .unwrap();
+
+            let count = Arc::new(AtomicUsize::new(0));
+            let count_cb = Arc::clone(&count);
+            let timer = node
+                .create_timer_repeating(Duration::from_millis(5), move || {
+                    count_cb.fetch_add(1, Ordering::Relaxed);
+                })
+                .unwrap();
+
+            executor.spin(SpinOptions::new().timeout(Duration::from_millis(100)));
+            assert!(count.load(Ordering::Relaxed) > 0, "timer never fired before cancel");
+
+            timer.cancel().unwrap();
+            executor.spin(SpinOptions::new().timeout(Duration::from_millis(50)));
+            let after_cancel = count.load(Ordering::Relaxed);
+            executor.spin(SpinOptions::new().timeout(Duration::from_millis(100)));
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                after_cancel,
+                "timer kept firing after cancel",
+            );
+
+            timer.reset().unwrap();
+            executor.spin(SpinOptions::new().timeout(Duration::from_millis(100)));
+            assert!(
+                count.load(Ordering::Relaxed) > after_cancel,
+                "timer did not resume firing after reset",
+            );
+        }
+    }
+
+    test_with_executors! {
+        /// `halt_spinning()` from another thread breaks out of an unbounded spin.
+        /// A timer proves the executor was actually spinning when it was halted.
+        fn halt_spinning_stops_spin(executor, node_name) {
+            let node = executor
+                .create_node(
+                    node_name.start_parameter_services(false),
+                )
+                .unwrap();
+
+            let fired = Arc::new(AtomicBool::new(false));
+            let fired_cb = Arc::clone(&fired);
+            let _timer = node
+                .create_timer_repeating(Duration::from_millis(10), move || {
+                    fired_cb.store(true, Ordering::Relaxed);
+                })
+                .unwrap();
+
+            let commands = Arc::clone(executor.commands());
+            let halter = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(150));
+                commands.halt_spinning();
+            });
+
+            // halt_spinning() fires at 150ms and is what should end this spin. The
+            // 5s timeout is only a failsafe: if halt is broken, the spin still
+            // terminates (instead of hanging the whole test binary forever), and the
+            // `elapsed < 2s` check below then fails because the return came from the
+            // timeout rather than the halt. The threshold must stay strictly below
+            // the failsafe timeout so a timeout-driven return is detected as failure.
+            let start = std::time::Instant::now();
+            executor.spin(SpinOptions::default().timeout(Duration::from_secs(5)));
+            let elapsed = start.elapsed();
+            halter.join().unwrap();
+
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "spin did not halt promptly after halt_spinning() (took {elapsed:?})",
+            );
+            assert!(
+                fired.load(Ordering::Relaxed),
+                "executor never actually spun before being halted",
+            );
+        }
     }
 
     #[test]

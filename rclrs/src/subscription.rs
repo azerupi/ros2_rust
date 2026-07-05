@@ -549,110 +549,109 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_node_subscription_raii() {
-        use crate::*;
-        use std::sync::atomic::{AtomicBool, Ordering};
+    test_with_executors! {
+        fn test_node_subscription_raii(executor, node_name) {
+            use crate::*;
+            use std::sync::atomic::{AtomicBool, Ordering};
 
-        let mut executor = Context::default().create_basic_executor();
+            let triggered = Arc::new(AtomicBool::new(false));
+            let inner_triggered = Arc::clone(&triggered);
+            let callback = move |_: msg::Empty| {
+                inner_triggered.store(true, Ordering::Release);
+            };
 
-        let triggered = Arc::new(AtomicBool::new(false));
-        let inner_triggered = Arc::clone(&triggered);
-        let callback = move |_: msg::Empty| {
-            inner_triggered.store(true, Ordering::Release);
-        };
+            let (_subscription, publisher) = {
+                let node = executor
+                    .create_node(node_name)
+                    .unwrap();
 
-        let (_subscription, publisher) = {
-            let node = executor
-                .create_node(&format!("test_node_subscription_raii_{}", line!()))
-                .unwrap();
+                let qos = QoSProfile::default().keep_all().reliable();
+                let subscription = node
+                    .create_subscription::<msg::Empty, _>("test_topic".qos(qos), callback)
+                    .unwrap();
+                let publisher = node
+                    .create_publisher::<msg::Empty>("test_topic".qos(qos))
+                    .unwrap();
 
-            let qos = QoSProfile::default().keep_all().reliable();
-            let subscription = node
-                .create_subscription::<msg::Empty, _>("test_topic".qos(qos), callback)
-                .unwrap();
-            let publisher = node
-                .create_publisher::<msg::Empty>("test_topic".qos(qos))
-                .unwrap();
+                (subscription, publisher)
+            };
 
-            (subscription, publisher)
-        };
-
-        publisher.publish(msg::Empty::default()).unwrap();
-        let start_time = std::time::Instant::now();
-        while !triggered.load(Ordering::Acquire) {
-            assert!(executor.spin(SpinOptions::spin_once()).is_empty());
-            assert!(start_time.elapsed() < std::time::Duration::from_secs(10));
+            publisher.publish(msg::Empty::default()).unwrap();
+            let start_time = std::time::Instant::now();
+            while !triggered.load(Ordering::Acquire) {
+                assert!(executor.spin(SpinOptions::spin_once()).is_empty());
+                assert!(start_time.elapsed() < std::time::Duration::from_secs(10));
+            }
         }
     }
 
-    #[test]
-    fn test_delayed_subscription() {
-        use crate::*;
-        use futures::{
-            channel::{mpsc, oneshot},
-            StreamExt,
-        };
-        use ros_env::example_interfaces::msg::Empty;
-        use std::sync::atomic::{AtomicBool, Ordering};
+    test_with_executors! {
+        fn test_delayed_subscription(executor, node_name) {
+            use crate::*;
+            use futures::{
+                channel::{mpsc, oneshot},
+                StreamExt,
+            };
+            use ros_env::example_interfaces::msg::Empty;
+            use std::sync::atomic::{AtomicBool, Ordering};
 
-        let mut executor = Context::default().create_basic_executor();
-        let node = executor
-            .create_node(
-                format!("test_delayed_subscription_{}", line!())
-                    // We need to turn off parameter services because their activity will
-                    // wake up the wait set, which defeats the purpose of this test.
-                    .start_parameter_services(false),
-            )
-            .unwrap();
+            let node = executor
+                .create_node(
+                    node_name
+                        // We need to turn off parameter services because their activity will
+                        // wake up the wait set, which defeats the purpose of this test.
+                        .start_parameter_services(false),
+                )
+                .unwrap();
 
-        let (promise, receiver) = oneshot::channel();
-        let promise = Arc::new(Mutex::new(Some(promise)));
+            let (promise, receiver) = oneshot::channel();
+            let promise = Arc::new(Mutex::new(Some(promise)));
 
-        let success = Arc::new(AtomicBool::new(false));
-        let send_success = Arc::clone(&success);
+            let success = Arc::new(AtomicBool::new(false));
+            let send_success = Arc::clone(&success);
 
-        let publisher = node.create_publisher("test_delayed_subscription").unwrap();
+            let publisher = node.create_publisher("test_delayed_subscription").unwrap();
 
-        let commands = Arc::clone(executor.commands());
-        std::thread::spawn(move || {
-            // Wait a little while so the executor can start spinning and guard
-            // conditions can settle down.
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            let commands = Arc::clone(executor.commands());
+            std::thread::spawn(move || {
+                // Wait a little while so the executor can start spinning and guard
+                // conditions can settle down.
+                std::thread::sleep(std::time::Duration::from_millis(10));
 
-            let _ = commands.run(async move {
-                let (sender, mut receiver) = mpsc::unbounded();
-                let _subscription = node
-                    .create_subscription("test_delayed_subscription", move |_: Empty| {
-                        let _ = sender.unbounded_send(());
-                    })
-                    .unwrap();
+                let _ = commands.run(async move {
+                    let (sender, mut receiver) = mpsc::unbounded();
+                    let _subscription = node
+                        .create_subscription("test_delayed_subscription", move |_: Empty| {
+                            let _ = sender.unbounded_send(());
+                        })
+                        .unwrap();
 
-                // Make sure the message doesn't get dropped due to the subscriber
-                // not being connected yet.
-                let _ = publisher.notify_on_subscriber_ready().await;
+                    // Make sure the message doesn't get dropped due to the subscriber
+                    // not being connected yet.
+                    let _ = publisher.notify_on_subscriber_ready().await;
 
-                // Publish the message, which should trigger the executor to stop spinning
-                publisher.publish(Empty::default()).unwrap();
+                    // Publish the message, which should trigger the executor to stop spinning
+                    publisher.publish(Empty::default()).unwrap();
 
-                if let Some(_) = receiver.next().await {
-                    send_success.store(true, Ordering::Release);
-                    if let Some(promise) = promise.lock().unwrap().take() {
-                        promise.send(()).unwrap();
+                    if let Some(_) = receiver.next().await {
+                        send_success.store(true, Ordering::Release);
+                        if let Some(promise) = promise.lock().unwrap().take() {
+                            promise.send(()).unwrap();
+                        }
                     }
-                }
+                });
             });
-        });
 
-        let r = executor.spin(
-            SpinOptions::default()
-                .until_promise_resolved(receiver)
-                .timeout(std::time::Duration::from_secs(10)),
-        );
+            let r = executor.spin(
+                SpinOptions::default()
+                    .until_promise_resolved(receiver)
+                    .timeout(std::time::Duration::from_secs(10)),
+            );
 
-        assert!(r.is_empty(), "{r:?}");
-        let message_was_received = success.load(Ordering::Acquire);
-        assert!(message_was_received);
+            assert!(r.is_empty(), "{r:?}");
+            let message_was_received = success.load(Ordering::Acquire);
+            assert!(message_was_received);
+        }
     }
 
     #[test]

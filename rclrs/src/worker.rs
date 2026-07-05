@@ -805,12 +805,18 @@ impl<Payload: 'static + Send + Sync> WorkScope for Worker<Payload> {
 
 #[cfg(test)]
 mod tests {
-    use crate::*;
+    use crate::{test_helpers::test_with_executors, *};
     use ros_env::test_msgs::{
         msg::Empty as EmptyMsg,
         srv::{Empty as EmptySrv, Empty_Request, Empty_Response},
     };
-    use std::time::Duration;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     #[derive(Default, Clone, Copy, Debug)]
     struct TestPayload {
@@ -819,66 +825,127 @@ mod tests {
         dynamic_subscription_count: usize,
     }
 
-    #[test]
-    fn test_worker() {
-        let mut executor = Context::default().create_basic_executor();
-        let node = executor.create_node("test_worker_node").unwrap();
-        let worker = node.create_worker(TestPayload::default());
-        let _count_sub = worker.create_subscription(
-            "test_worker_topic",
-            |payload: &mut TestPayload, _msg: EmptyMsg| {
-                payload.subscription_count += 1;
-            },
-        );
+    test_with_executors! {
+        fn test_worker(executor, node_name) {
+            let node = executor
+                .create_node(node_name)
+                .unwrap();
+            let worker = node.create_worker(TestPayload::default());
+            let _count_sub = worker.create_subscription(
+                "test_worker_topic",
+                |payload: &mut TestPayload, _msg: EmptyMsg| {
+                    payload.subscription_count += 1;
+                },
+            );
 
-        let _count_dynamic_sub = worker.create_dynamic_subscription(
-            "test_msgs/msg/Empty".try_into().unwrap(),
-            "test_worker_topic",
-            |payload: &mut TestPayload, _, _| {
-                payload.dynamic_subscription_count += 1;
-            },
-        );
+            let _count_dynamic_sub = worker.create_dynamic_subscription(
+                "test_msgs/msg/Empty".try_into().unwrap(),
+                "test_worker_topic",
+                |payload: &mut TestPayload, _, _| {
+                    payload.dynamic_subscription_count += 1;
+                },
+            );
 
-        let _count_srv = worker.create_service::<EmptySrv, _>(
-            "test_worker_service",
-            |payload: &mut TestPayload, _req: Empty_Request| {
-                payload.service_count += 1;
-                Empty_Response::default()
-            },
-        );
+            let _count_srv = worker.create_service::<EmptySrv, _>(
+                "test_worker_service",
+                |payload: &mut TestPayload, _req: Empty_Request| {
+                    payload.service_count += 1;
+                    Empty_Response::default()
+                },
+            );
 
-        let promise = worker.listen_until(move |payload| {
-            if payload.service_count > 0
-                && payload.subscription_count > 0
-                && payload.dynamic_subscription_count > 0
-            {
-                Some(*payload)
-            } else {
-                None
-            }
-        });
+            let promise = worker.listen_until(move |payload| {
+                if payload.service_count > 0
+                    && payload.subscription_count > 0
+                    && payload.dynamic_subscription_count > 0
+                {
+                    Some(*payload)
+                } else {
+                    None
+                }
+            });
 
-        let publisher = node.create_publisher("test_worker_topic").unwrap();
-        publisher.publish(EmptyMsg::default()).unwrap();
+            let publisher = node.create_publisher("test_worker_topic").unwrap();
+            publisher.publish(EmptyMsg::default()).unwrap();
 
-        let client = node
-            .create_client::<EmptySrv>("test_worker_service")
-            .unwrap();
-        let _: Promise<Empty_Response> = client.call(Empty_Request::default()).unwrap();
+            let client = node
+                .create_client::<EmptySrv>("test_worker_service")
+                .unwrap();
+            let _: Promise<Empty_Response> = client.call(Empty_Request::default()).unwrap();
 
-        let (mut promise, notice) = executor.commands().create_notice(promise);
+            let (mut promise, notice) = executor.commands().create_notice(promise);
 
-        executor
-            .spin(
-                SpinOptions::new()
-                    .until_promise_resolved(notice)
-                    .timeout(Duration::from_millis(500)),
-            )
-            .first_error()
-            .unwrap();
+            executor
+                .spin(
+                    SpinOptions::new()
+                        .until_promise_resolved(notice)
+                        .timeout(Duration::from_millis(500)),
+                )
+                .first_error()
+                .unwrap();
 
-        let payload = promise.try_recv().unwrap().unwrap();
-        assert_eq!(payload.subscription_count, 1);
-        assert_eq!(payload.service_count, 1);
+            let payload = promise.try_recv().unwrap().unwrap();
+            assert_eq!(payload.subscription_count, 1);
+            assert_eq!(payload.service_count, 1);
+        }
+    }
+
+    test_with_executors! {
+        /// A worker serializes its callbacks: even on the multi-threaded Tokio
+        /// executor, two callbacks belonging to the same worker must never run
+        /// concurrently. Two fast timers on one worker compete; each callback
+        /// holds an "active" marker briefly, and any overlap is recorded. On a
+        /// single-threaded executor this is trivially true; on Tokio it verifies
+        /// the per-worker mutual exclusion guarantee.
+        fn worker_serializes_callbacks(executor, node_name) {
+            let node = executor
+                .create_node(
+                    node_name.start_parameter_services(false),
+                )
+                .unwrap();
+            let worker = node.create_worker::<usize>(0);
+
+            let active = Arc::new(AtomicUsize::new(0));
+            let runs = Arc::new(AtomicUsize::new(0));
+            let overlaps = Arc::new(AtomicUsize::new(0));
+
+            // Build a callback that flags any concurrent entry. The brief hold
+            // widens the window so a (wrongly) parallel dispatch would be caught.
+            let make_cb = || {
+                let active = Arc::clone(&active);
+                let runs = Arc::clone(&runs);
+                let overlaps = Arc::clone(&overlaps);
+                move |_payload: &mut usize| {
+                    if active.fetch_add(1, Ordering::SeqCst) != 0 {
+                        overlaps.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    runs.fetch_add(1, Ordering::SeqCst);
+                }
+            };
+
+            let _t1 = worker
+                .create_timer_repeating(Duration::from_millis(5), make_cb())
+                .unwrap();
+            let _t2 = worker
+                .create_timer_repeating(Duration::from_millis(5), make_cb())
+                .unwrap();
+
+            executor.spin(SpinOptions::new().timeout(Duration::from_millis(300)));
+
+            assert!(
+                runs.load(Ordering::SeqCst) >= 5,
+                "worker callbacks barely ran ({} times); test is inconclusive",
+                runs.load(Ordering::SeqCst),
+            );
+            assert_eq!(
+                overlaps.load(Ordering::SeqCst),
+                0,
+                "worker ran callbacks concurrently {} time(s); per-worker mutual \
+                 exclusion was violated",
+                overlaps.load(Ordering::SeqCst),
+            );
+        }
     }
 }

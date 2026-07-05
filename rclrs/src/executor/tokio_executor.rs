@@ -1187,29 +1187,6 @@ mod tests {
         );
     }
 
-    /// A spin with a timeout and no work reports a `Timeout` error, matching the
-    /// basic executor's contract (rather than returning silently).
-    #[test]
-    fn tokio_spin_timeout_reports_error() -> Result<(), RclrsError> {
-        let mut executor = Context::default().create_tokio_executor();
-        let _node = executor.create_node(
-            format!("test_tokio_timeout_{}", line!()).start_parameter_services(false),
-        )?;
-
-        let errors = executor.spin(SpinOptions::default().timeout(Duration::from_millis(20)));
-        assert!(
-            errors.iter().any(|e| matches!(
-                e,
-                RclrsError::RclError {
-                    code: RclReturnCode::Timeout,
-                    ..
-                }
-            )),
-            "expected a Timeout error from a timed-out spin, got {errors:?}",
-        );
-        Ok(())
-    }
-
     /// `only_next_available_work` (spin_once) drains the currently-available work
     /// and returns promptly — it must not be ignored (loop forever) on the Tokio
     /// path. We publish then spin_once until the message is delivered.

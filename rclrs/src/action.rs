@@ -256,376 +256,333 @@ fn empty_goal_status_array() -> DropGuard<rcl_action_goal_status_array_t> {
 
 #[cfg(test)]
 mod tests {
-    use crate::*;
+    use crate::{test_helpers::test_with_executors, *};
     use futures::StreamExt;
     use ros_env::example_interfaces::action::{
         Fibonacci, Fibonacci_Feedback, Fibonacci_Goal, Fibonacci_Result,
     };
-    use std::time::Duration;
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
     use tokio::sync::mpsc::unbounded_channel;
 
-    #[test]
-    fn test_action_server_availability() {
-        let mut executor = Context::default().create_basic_executor();
+    test_with_executors! {
+        fn test_action_server_availability(executor, node_name) {
+            let node = executor
+                .create_node(node_name)
+                .unwrap();
+            let action_name = format!("{node_name}_action");
 
-        let node = executor
-            .create_node(&format!("test_action_discovery_{}", line!()))
-            .unwrap();
-        let action_name = format!("test_action_discovery_{}_action", line!());
+            let client = node
+                .create_action_client::<Fibonacci>(&action_name)
+                .unwrap();
 
-        let client = node
-            .create_action_client::<Fibonacci>(&action_name)
-            .unwrap();
+            assert!(!client.server_is_available().unwrap());
 
-        assert!(!client.server_is_available().unwrap());
+            let _action_server = node
+                .create_action_server(&action_name, |handle| {
+                    fibonacci_action(handle, TestActionSettings::default())
+                })
+                .unwrap();
 
-        let _action_server = node
-            .create_action_server(&action_name, |handle| {
-                fibonacci_action(handle, TestActionSettings::default())
-            })
-            .unwrap();
+            let done = Arc::new(AtomicBool::new(false));
+            let done_cb = Arc::clone(&done);
+            let promise = executor.commands().run(async move {
+                let timeout = Duration::from_secs(1);
+                let start = std::time::Instant::now();
+                let mut is_available = false;
 
-        let promise = executor.commands().run(async move {
-            let timeout = Duration::from_secs(1);
-            let start = std::time::Instant::now();
-            let mut is_available = false;
-
-            while start.elapsed() < timeout {
-                if client.server_is_available().unwrap() {
-                    is_available = true;
-                    break;
+                while start.elapsed() < timeout {
+                    if client.server_is_available().unwrap() {
+                        is_available = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
 
-            assert!(
-                is_available,
-                "Server is not available after {} seconds",
-                timeout.as_secs()
+                assert!(
+                    is_available,
+                    "Server is not available after {} seconds",
+                    timeout.as_secs()
+                );
+                done_cb.store(true, Ordering::Relaxed);
+            });
+
+            // A timeout keeps the multi-threaded Tokio executor from blocking forever
+            // if the promise never resolves; the `done` flag turns a timeout into a
+            // failure rather than a silent pass (an assertion that panics inside the
+            // async task on Tokio aborts the task instead of failing the test).
+            executor.spin(
+                SpinOptions::default()
+                    .until_promise_resolved(promise)
+                    .timeout(Duration::from_secs(10)),
             );
-        });
-
-        executor.spin(SpinOptions::default().until_promise_resolved(promise));
+            assert!(
+                done.load(Ordering::Relaxed),
+                "server availability check did not complete",
+            );
+        }
     }
 
-    #[test]
-    fn test_action_success_streaming() {
-        let mut executor = Context::default().create_basic_executor();
+    test_with_executors! {
+        fn test_action_success_streaming(executor, node_name) {
+            let node = executor
+                .create_node(node_name)
+                .unwrap();
+            let action_name = format!("{node_name}_action");
+            let _action_server = node
+                .create_action_server(&action_name, |handle| {
+                    fibonacci_action(handle, TestActionSettings::default())
+                })
+                .unwrap();
 
-        let node = executor
-            .create_node(&format!("test_action_success_{}", line!()))
-            .unwrap();
-        let action_name = format!("test_action_success_{}_action", line!());
-        let _action_server = node
-            .create_action_server(&action_name, |handle| {
-                fibonacci_action(handle, TestActionSettings::default())
-            })
-            .unwrap();
+            let client = node
+                .create_action_client::<Fibonacci>(&action_name)
+                .unwrap();
 
-        let client = node
-            .create_action_client::<Fibonacci>(&action_name)
-            .unwrap();
+            let order_10_sequence = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55];
 
-        let order_10_sequence = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55];
+            let request = client.request_goal(Fibonacci_Goal { order: 10 });
 
-        let request = client.request_goal(Fibonacci_Goal { order: 10 });
-
-        let promise = executor.commands().run(async move {
-            let mut goal_client_stream = request.await.unwrap().stream();
-            let mut expected_feedback_len = 0;
-            while let Some(event) = goal_client_stream.next().await {
-                match event {
-                    GoalEvent::Feedback(feedback) => {
-                        expected_feedback_len += 1;
-                        assert_eq!(feedback.sequence.len(), expected_feedback_len);
-                    }
-                    GoalEvent::Status(s) => {
-                        assert!(
-                            matches!(
+            let streamed = Arc::new(AtomicBool::new(false));
+            let streamed_cb = Arc::clone(&streamed);
+            let promise = executor.commands().run(async move {
+                let mut goal_client_stream = request.await.unwrap().stream();
+                let mut expected_feedback_len = 0;
+                while let Some(event) = goal_client_stream.next().await {
+                    match event {
+                        GoalEvent::Feedback(feedback) => {
+                            expected_feedback_len += 1;
+                            assert_eq!(feedback.sequence.len(), expected_feedback_len);
+                        }
+                        GoalEvent::Status(s) => {
+                            assert!(
+                                matches!(
+                                    s.code,
+                                    GoalStatusCode::Unknown
+                                        | GoalStatusCode::Executing
+                                        | GoalStatusCode::Succeeded
+                                ),
+                                "Actual code: {:?}",
                                 s.code,
-                                GoalStatusCode::Unknown
-                                    | GoalStatusCode::Executing
-                                    | GoalStatusCode::Succeeded
-                            ),
-                            "Actual code: {:?}",
-                            s.code,
-                        );
-                    }
-                    GoalEvent::Result((status, result)) => {
-                        assert_eq!(status, GoalStatusCode::Succeeded);
-                        assert_eq!(result.sequence, order_10_sequence);
-                        return;
+                            );
+                        }
+                        GoalEvent::Result((status, result)) => {
+                            assert_eq!(status, GoalStatusCode::Succeeded);
+                            assert_eq!(result.sequence, order_10_sequence);
+                            streamed_cb.store(true, Ordering::Relaxed);
+                            return;
+                        }
                     }
                 }
-            }
-        });
+            });
 
-        executor.spin(SpinOptions::default().until_promise_resolved(promise));
+            // Timeout + completion flag so the multi-threaded Tokio executor cannot
+            // hang, and a timeout fails the test instead of passing silently.
+            executor.spin(
+                SpinOptions::default()
+                    .until_promise_resolved(promise)
+                    .timeout(Duration::from_secs(10)),
+            );
+            assert!(
+                streamed.load(Ordering::Relaxed),
+                "action goal streaming round-trip did not complete",
+            );
 
-        let request = client.request_goal(Fibonacci_Goal { order: 10 });
+            let request = client.request_goal(Fibonacci_Goal { order: 10 });
 
-        let promise = executor.commands().run(async move {
-            let (status, result) = request.await.unwrap().result.await;
-            assert_eq!(status, GoalStatusCode::Succeeded);
-            assert_eq!(result.sequence, order_10_sequence);
-        });
+            let got_result = Arc::new(AtomicBool::new(false));
+            let got_result_cb = Arc::clone(&got_result);
+            let promise = executor.commands().run(async move {
+                let (status, result) = request.await.unwrap().result.await;
+                assert_eq!(status, GoalStatusCode::Succeeded);
+                assert_eq!(result.sequence, order_10_sequence);
+                got_result_cb.store(true, Ordering::Relaxed);
+            });
 
-        executor.spin(SpinOptions::default().until_promise_resolved(promise));
+            executor.spin(
+                SpinOptions::default()
+                    .until_promise_resolved(promise)
+                    .timeout(Duration::from_secs(10)),
+            );
+            assert!(
+                got_result.load(Ordering::Relaxed),
+                "action goal result round-trip did not complete",
+            );
+        }
     }
 
-    #[test]
-    fn test_action_cancel() {
-        let mut executor = Context::default().create_basic_executor();
+    test_with_executors! {
+        fn test_action_cancel(executor, node_name) {
+            let node = executor
+                .create_node(node_name)
+                .unwrap();
+            let action_name = format!("{node_name}_action");
+            let _action_server = node
+                .create_action_server(&action_name, |handle| {
+                    fibonacci_action(handle, TestActionSettings::slow())
+                })
+                .unwrap();
 
-        let node = executor
-            .create_node(&format!("test_action_cancel_{}", line!()))
-            .unwrap();
-        let action_name = format!("test_action_cancel_{}_action", line!());
-        let _action_server = node
-            .create_action_server(&action_name, |handle| {
-                fibonacci_action(handle, TestActionSettings::slow())
-            })
-            .unwrap();
+            let client = node
+                .create_action_client::<Fibonacci>(&action_name)
+                .unwrap();
 
-        let client = node
-            .create_action_client::<Fibonacci>(&action_name)
-            .unwrap();
+            let request = client.request_goal(Fibonacci_Goal { order: 10 });
 
-        let request = client.request_goal(Fibonacci_Goal { order: 10 });
+            let done = Arc::new(AtomicBool::new(false));
+            let done_cb = Arc::clone(&done);
+            let promise = executor.commands().run(async move {
+                let goal_client = request.await.unwrap();
+                let cancellation = goal_client.cancellation.cancel().await;
+                assert!(cancellation.is_accepted());
+                let (status, _) = goal_client.result.await;
+                assert_eq!(status, GoalStatusCode::Cancelled);
+                done_cb.store(true, Ordering::Relaxed);
+            });
 
-        let promise = executor.commands().run(async move {
-            let goal_client = request.await.unwrap();
-            let cancellation = goal_client.cancellation.cancel().await;
-            assert!(cancellation.is_accepted());
-            let (status, _) = goal_client.result.await;
-            assert_eq!(status, GoalStatusCode::Cancelled);
-        });
-
-        executor.spin(SpinOptions::default().until_promise_resolved(promise));
+            executor.spin(
+                SpinOptions::default()
+                    .until_promise_resolved(promise)
+                    .timeout(Duration::from_secs(10)),
+            );
+            assert!(
+                done.load(Ordering::Relaxed),
+                "action cancellation did not complete",
+            );
+        }
     }
 
-    /// A full goal round-trip (feedback streaming + result) driven by the
-    /// event-driven Tokio executor, exercising the action push-callback path
-    /// (`rcl_action_{server,client}_set_*_callback`). The completion flag makes a
-    /// timeout fail the test rather than pass silently.
-    #[cfg(feature = "tokio-executor")]
-    #[test]
-    fn test_action_success_streaming_tokio() {
-        use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        };
+    test_with_executors! {
+        fn test_action_cancel_rejection(executor, node_name) {
+            let node = executor
+                .create_node(node_name)
+                .unwrap();
+            let action_name = format!("{node_name}_action");
+            let _action_server = node
+                .create_action_server(&action_name, |handle| {
+                    // This action server will intentionally reject 3 cancellation requests
+                    fibonacci_action(handle, TestActionSettings::slow().cancel_refusal(3))
+                })
+                .unwrap();
 
-        let mut executor = Context::default().create_tokio_executor();
+            let client = node
+                .create_action_client::<Fibonacci>(&action_name)
+                .unwrap();
 
-        let node = executor
-            .create_node(&format!("test_action_success_tokio_{}", line!()))
-            .unwrap();
-        let action_name = format!("test_action_success_tokio_{}_action", line!());
-        let _action_server = node
-            .create_action_server(&action_name, |handle| {
-                fibonacci_action(handle, TestActionSettings::default())
-            })
-            .unwrap();
+            let request = client.request_goal(Fibonacci_Goal { order: 10 });
 
-        let client = node
-            .create_action_client::<Fibonacci>(&action_name)
-            .unwrap();
+            let done = Arc::new(AtomicBool::new(false));
+            let done_cb = Arc::clone(&done);
+            let promise = executor.commands().run(async move {
+                let goal_client = request.await.unwrap();
 
-        let order_10_sequence = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55];
-        let request = client.request_goal(Fibonacci_Goal { order: 10 });
-
-        let done = Arc::new(AtomicBool::new(false));
-        let done_cb = Arc::clone(&done);
-        let promise = executor.commands().run(async move {
-            let mut goal_client_stream = request.await.unwrap().stream();
-            let mut expected_feedback_len = 0;
-            while let Some(event) = goal_client_stream.next().await {
-                match event {
-                    GoalEvent::Feedback(feedback) => {
-                        expected_feedback_len += 1;
-                        assert_eq!(feedback.sequence.len(), expected_feedback_len);
-                    }
-                    GoalEvent::Status(_) => {}
-                    GoalEvent::Result((status, result)) => {
-                        assert_eq!(status, GoalStatusCode::Succeeded);
-                        assert_eq!(result.sequence, order_10_sequence);
-                        done_cb.store(true, Ordering::Relaxed);
-                        return;
-                    }
+                // The first three cancellation requests should be rejected
+                for _ in 0..3 {
+                    let cancellation = goal_client.cancellation.cancel().await;
+                    assert!(cancellation.is_rejected());
                 }
-            }
-        });
 
-        executor.spin(
-            SpinOptions::default()
-                .until_promise_resolved(promise)
-                .timeout(Duration::from_secs(15)),
-        );
-
-        assert!(
-            done.load(Ordering::Relaxed),
-            "action goal round-trip did not complete on the Tokio executor",
-        );
-    }
-
-    /// A goal cancellation driven by the Tokio executor, exercising the action
-    /// client's cancel-client and the server's cancel-service push callbacks.
-    #[cfg(feature = "tokio-executor")]
-    #[test]
-    fn test_action_cancel_tokio() {
-        use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        };
-
-        let mut executor = Context::default().create_tokio_executor();
-
-        let node = executor
-            .create_node(&format!("test_action_cancel_tokio_{}", line!()))
-            .unwrap();
-        let action_name = format!("test_action_cancel_tokio_{}_action", line!());
-        let _action_server = node
-            .create_action_server(&action_name, |handle| {
-                fibonacci_action(handle, TestActionSettings::slow())
-            })
-            .unwrap();
-
-        let client = node
-            .create_action_client::<Fibonacci>(&action_name)
-            .unwrap();
-
-        let request = client.request_goal(Fibonacci_Goal { order: 10 });
-
-        let done = Arc::new(AtomicBool::new(false));
-        let done_cb = Arc::clone(&done);
-        let promise = executor.commands().run(async move {
-            let goal_client = request.await.unwrap();
-            let cancellation = goal_client.cancellation.cancel().await;
-            assert!(cancellation.is_accepted());
-            let (status, _) = goal_client.result.await;
-            assert_eq!(status, GoalStatusCode::Cancelled);
-            done_cb.store(true, Ordering::Relaxed);
-        });
-
-        executor.spin(
-            SpinOptions::default()
-                .until_promise_resolved(promise)
-                .timeout(Duration::from_secs(15)),
-        );
-
-        assert!(
-            done.load(Ordering::Relaxed),
-            "action cancellation did not complete on the Tokio executor",
-        );
-    }
-
-    #[test]
-    fn test_action_cancel_rejection() {
-        let mut executor = Context::default().create_basic_executor();
-
-        let node = executor
-            .create_node(&format!("test_action_cancel_refusal_{}", line!()))
-            .unwrap();
-        let action_name = format!("test_action_cancel_refusal_{}_action", line!());
-        let _action_server = node
-            .create_action_server(&action_name, |handle| {
-                // This action server will intentionally reject 3 cancellation requests
-                fibonacci_action(handle, TestActionSettings::slow().cancel_refusal(3))
-            })
-            .unwrap();
-
-        let client = node
-            .create_action_client::<Fibonacci>(&action_name)
-            .unwrap();
-
-        let request = client.request_goal(Fibonacci_Goal { order: 10 });
-
-        let promise = executor.commands().run(async move {
-            let goal_client = request.await.unwrap();
-
-            // The first three cancellation requests should be rejected
-            for _ in 0..3 {
+                // The next cancellation request should be accepted
                 let cancellation = goal_client.cancellation.cancel().await;
-                assert!(cancellation.is_rejected());
-            }
+                assert!(cancellation.is_accepted());
 
-            // The next cancellation request should be accepted
-            let cancellation = goal_client.cancellation.cancel().await;
-            assert!(cancellation.is_accepted());
+                // The next one should also be accepted or we get notified that the
+                // goal no longer exists.
+                let late_cancellation = goal_client.cancellation.cancel().await;
+                assert!(matches!(
+                    late_cancellation.code,
+                    CancelResponseCode::Accept | CancelResponseCode::GoalTerminated
+                ));
 
-            // The next one should also be accepted or we get notified that the
-            // goal no longer exists.
-            let late_cancellation = goal_client.cancellation.cancel().await;
-            assert!(matches!(
-                late_cancellation.code,
-                CancelResponseCode::Accept | CancelResponseCode::GoalTerminated
-            ));
+                let (status, _) = goal_client.result.await;
+                assert_eq!(status, GoalStatusCode::Cancelled);
 
-            let (status, _) = goal_client.result.await;
-            assert_eq!(status, GoalStatusCode::Cancelled);
+                // After we have received the response, we can be confident that the
+                // action server will report back that the goal was terminated.
+                let very_late_cancellation = goal_client.cancellation.cancel().await;
+                assert!(matches!(
+                    very_late_cancellation.code,
+                    CancelResponseCode::GoalTerminated
+                ));
+                done_cb.store(true, Ordering::Relaxed);
+            });
 
-            // After we have received the response, we can be confident that the
-            // action server will report back that the goal was terminated.
-            let very_late_cancellation = goal_client.cancellation.cancel().await;
-            assert!(matches!(
-                very_late_cancellation.code,
-                CancelResponseCode::GoalTerminated
-            ));
-        });
-
-        executor.spin(SpinOptions::default().until_promise_resolved(promise));
+            executor.spin(
+                SpinOptions::default()
+                    .until_promise_resolved(promise)
+                    .timeout(Duration::from_secs(10)),
+            );
+            assert!(
+                done.load(Ordering::Relaxed),
+                "action cancel-rejection sequence did not complete",
+            );
+        }
     }
 
-    #[test]
-    fn test_action_slow_cancel() {
-        let mut executor = Context::default().create_basic_executor();
+    test_with_executors! {
+        fn test_action_slow_cancel(executor, node_name) {
+            let node = executor
+                .create_node(node_name)
+                .unwrap();
+            let action_name = format!("{node_name}_action");
+            let _action_server = node
+                .create_action_server(&action_name, |handle| {
+                    // This action server will intentionally reject 3 cancellation requests
+                    fibonacci_action(
+                        handle,
+                        TestActionSettings::slow()
+                            .cancel_refusal(3)
+                            .continue_after_cancelling(),
+                    )
+                })
+                .unwrap();
 
-        let node = executor
-            .create_node(&format!("test_action_slow_cancel_{}", line!()))
-            .unwrap();
-        let action_name = format!("test_action_slow_cancel_{}_action", line!());
-        let _action_server = node
-            .create_action_server(&action_name, |handle| {
-                // This action server will intentionally reject 3 cancellation requests
-                fibonacci_action(
-                    handle,
-                    TestActionSettings::slow()
-                        .cancel_refusal(3)
-                        .continue_after_cancelling(),
-                )
-            })
-            .unwrap();
+            let client = node
+                .create_action_client::<Fibonacci>(&action_name)
+                .unwrap();
 
-        let client = node
-            .create_action_client::<Fibonacci>(&action_name)
-            .unwrap();
+            let request = client.request_goal(Fibonacci_Goal { order: 10 });
 
-        let request = client.request_goal(Fibonacci_Goal { order: 10 });
+            let done = Arc::new(AtomicBool::new(false));
+            let done_cb = Arc::clone(&done);
+            let promise = executor.commands().run(async move {
+                let goal_client = request.await.unwrap();
 
-        let promise = executor.commands().run(async move {
-            let goal_client = request.await.unwrap();
+                // The first three cancellation requests should be rejected
+                for _ in 0..3 {
+                    let cancellation = goal_client.cancellation.cancel().await;
+                    assert!(cancellation.is_rejected());
+                }
 
-            // The first three cancellation requests should be rejected
-            for _ in 0..3 {
+                // The next cancellation request should be accepted
                 let cancellation = goal_client.cancellation.cancel().await;
-                assert!(cancellation.is_rejected());
-            }
+                assert!(cancellation.is_accepted());
 
-            // The next cancellation request should be accepted
-            let cancellation = goal_client.cancellation.cancel().await;
-            assert!(cancellation.is_accepted());
+                // The next one should also be accepted or we get notified that the
+                // goal no longer exists.
+                let late_cancellation = goal_client.cancellation.cancel().await;
+                assert!(late_cancellation.is_accepted());
 
-            // The next one should also be accepted or we get notified that the
-            // goal no longer exists.
-            let late_cancellation = goal_client.cancellation.cancel().await;
-            assert!(late_cancellation.is_accepted());
+                let very_late_cancellation = goal_client.cancellation.cancel().await;
+                assert!(very_late_cancellation.is_accepted());
+                done_cb.store(true, Ordering::Relaxed);
+            });
 
-            let very_late_cancellation = goal_client.cancellation.cancel().await;
-            assert!(very_late_cancellation.is_accepted());
-        });
-
-        executor.spin(SpinOptions::default().until_promise_resolved(promise));
+            executor.spin(
+                SpinOptions::default()
+                    .until_promise_resolved(promise)
+                    .timeout(Duration::from_secs(10)),
+            );
+            assert!(
+                done.load(Ordering::Relaxed),
+                "action slow-cancel sequence did not complete",
+            );
+        }
     }
 
     async fn fibonacci_action(
