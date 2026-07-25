@@ -160,6 +160,82 @@ struct DriveConfig {
 }
 ```
 
+## Entries named by whoever configures the node
+
+A driver often manages a set of devices whose names only the integrator knows: the sensors on a
+robot, the motors on an arm. Give it a map, and the entries come from the parameter file:
+
+```rust
+#[derive(ParameterSet, Debug)]
+struct SensorHub {
+    /// One entry per sensor, named in the parameter file.
+    sensors: BTreeMap<String, SensorConfig>,
+}
+
+#[derive(ParameterSet, Debug)]
+struct SensorConfig {
+    /// Publish rate in Hz.
+    #[param(default = 30, range = 1..=100)]
+    rate: i64,
+    /// Frame this sensor reports in.
+    #[param(default = "base_link")]
+    frame_id: String,
+}
+```
+
+```yaml
+/sensor_hub:
+  ros__parameters:
+    sensors:
+      front_lidar:
+        rate: 40
+      rear_lidar:
+        rate: 10
+        frame_id: rear_mount
+```
+
+```rust
+let params = node.declare_parameters::<SensorHub>()?;
+for (name, sensor) in &params.sensors {
+    start_sensor(name, sensor.rate.get());
+}
+```
+
+Every leaf is an ordinary parameter. `sensors.front_lidar.rate` appears in `ros2 param list`, has
+the description and range from `SensorConfig`, and can be watched with `on_change`. ROS 2 has no map
+parameter type, so the entry names are recovered from the parameters the node was configured with.
+`HashMap` and `BTreeMap` both work, differing only in iteration order.
+
+What follows from that:
+
+* **The entries are fixed when the map is declared.** A name that turns up later, over
+  `SetParameters`, names a parameter that was never declared, and is rejected like any other
+  undeclared parameter. Adding a device is a restart.
+* **A default supplies entries too**, so a node can have built-in ones that a parameter file adds
+  to or overrides.
+* **No entries is an empty map**, not an error.
+* Only a name with parameters *under* it is an entry, so a `sensors` parameter that is a plain
+  value alongside `sensors.front_lidar.rate` does not become an entry.
+
+Combine a map with an enum set and the entries do not even have to be the same kind of thing:
+
+```rust
+#[derive(ParameterSet, Debug)]
+struct DeviceHub {
+    devices: BTreeMap<String, DeviceConfig>,   // DeviceConfig is an enum set
+}
+```
+
+```yaml
+devices:
+  front_lidar:
+    type: lidar
+    rate: 40
+  main_camera:
+    type: camera
+    width: 640
+```
+
 ## One entry, several shapes
 
 Sometimes a configuration is *one of* several things, each needing different parameters: a sensor
@@ -361,11 +437,11 @@ struct DriveConfig {
 }
 ```
 
-Where a value is supplied for a set as a whole, by `#[parameters(default = ...)]` or by a parent
-field's `default`, that value wins. A field's own `#[param(default = ...)]` is then the fallback for
-whatever it does not cover. The supplied value is specific to that one instance of the set, whereas
-a field attribute says what the type defaults to in general, so a parent can configure a set it did
-not write:
+Where a value is supplied for a set as a whole, by `#[parameters(default = ...)]`, by a parent
+field's `default`, or by one entry of a map, that value wins. A field's own
+`#[param(default = ...)]` is then the fallback for whatever it does not cover. The supplied value is
+specific to that one instance of the set, whereas a field attribute says what the type defaults to
+in general, so a parent can configure a set it did not write:
 
 ```rust
 #[derive(ParameterSet)]

@@ -125,9 +125,9 @@ fn handle_field_doc(field: &Field) -> String {
 ///
 /// A supplied value is authoritative for every field, and a field's own `#[param(default = ...)]`
 /// is the fallback for the fields it does not cover. A supplied value is specific to *this*
-/// instance of the set -- it comes from a parent field's `default` or from
-/// `#[parameters(default = ...)]` -- whereas a field attribute states what the type defaults to
-/// in general.
+/// instance of the set -- it comes from a parent field's `default`, from
+/// `#[parameters(default = ...)]`, or from one entry of a map -- whereas a field attribute states
+/// what the type defaults to in general.
 fn destructure_defaults(set: &SetAttrs, declared: &[&Field]) -> TokenStream {
     let source = match &set.default {
         Some(expr) => quote! {

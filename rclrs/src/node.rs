@@ -1429,7 +1429,6 @@ impl NodeState {
     }
 
     /// Access to this node's parameter interface, for the parameter implementation itself.
-    #[cfg(test)]
     pub(crate) fn parameter_interface(&self) -> &ParameterInterface {
         &self.parameter
     }
