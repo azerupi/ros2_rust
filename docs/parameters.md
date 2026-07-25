@@ -160,6 +160,69 @@ struct DriveConfig {
 }
 ```
 
+## One entry, several shapes
+
+Sometimes a configuration is *one of* several things, each needing different parameters: a sensor
+that might be a lidar or a camera, a controller that might be PID or bang-bang. Derive
+`ParameterSet` on an enum:
+
+```rust
+/// Configuration for one sensor.
+#[derive(ParameterSet, Debug)]
+#[parameters(rename_all = "snake_case")]
+enum SensorConfig {
+    /// A 2D scanning lidar.
+    Lidar {
+        /// Scan rate in Hz.
+        #[param(default = 30, range = 1..=100)]
+        rate: i64,
+        /// Maximum usable range in m.
+        #[param(default = 25.0)]
+        range_m: f64,
+    },
+    /// A USB camera. Delegates to an existing parameter set.
+    Camera(CameraConfig),
+    /// Present but not configured.
+    Disabled,
+}
+```
+
+```yaml
+/sensor_hub:
+  ros__parameters:
+    type: lidar
+    rate: 40
+    range_m: 30.0
+```
+
+A read-only string parameter says which variant is in use. It is called `type`, renameable with
+`#[parameters(tag = "...")]`, and that variant's parameters are declared alongside it. Only the
+selected variant's parameters exist: nothing is declared for a lidar when the file says `camera`.
+The valid values appear in the tag's descriptor, and a value that is not one of them fails the
+declaration with a message naming them.
+
+Three variant shapes work:
+
+* **struct variants** declare their fields under the set's own namespace,
+* **newtype variants over another `ParameterSet`** delegate to it, so an existing config struct can
+  be reused unchanged,
+* **unit variants** declare nothing beyond the tag.
+
+Read it back by matching on the generated variant handles, or take a snapshot:
+
+```rust
+let params = node.declare_parameters::<SensorConfig>()?;
+match &params.variant {
+    SensorConfigVariantParams::Lidar { rate, .. } => start_lidar(rate.get()),
+    SensorConfigVariantParams::Camera(camera) => start_camera(camera.width.get()),
+    SensorConfigVariantParams::Disabled => {}
+}
+```
+
+The tag is read-only because the set of parameters that exist depends on it: switching variants at
+runtime would mean undeclaring one group and declaring another, invalidating handles the caller is
+holding. Changing which variant a node uses is a restart.
+
 ## Value types
 
 Beyond the nine types ROS 2 has parameters for, a field may be any of:

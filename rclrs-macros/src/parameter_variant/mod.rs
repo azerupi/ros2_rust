@@ -10,7 +10,7 @@
 //! * `#[parameter(transparent)]` on a newtype takes on the representation of the type inside it,
 //! * `#[parameter(from_str)]` uses [`FromStr`](std::str::FromStr) and [`Display`](std::fmt::Display).
 
-mod attrs;
+pub(crate) mod attrs;
 mod codegen;
 
 use syn::{Data, DeriveInput, Fields};
