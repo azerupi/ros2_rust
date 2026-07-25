@@ -184,12 +184,83 @@ Use `i64`, or `u32` when the value must be unsigned.
 `Duration` is not a parameter type either, because the unit it was stored in would be left
 implicit. `DurationSecs` and `DurationMillis` say which, and both deref to `Duration`.
 
-To use a type of your own, implement `ParameterVariant` for it and then call
-`declare_parameter_field!`:
+### Types of your own
+
+`#[derive(ParameterVariant)]` represents a type of your own as one of those. Which
+representation it uses follows from the shape of the type.
+
+**An enum whose variants carry no data** becomes a string, which is how a closed set of choices
+is normally written in a parameter file:
+
+```rust
+/// Which quantity the controller closes the loop on.
+#[derive(ParameterVariant, Clone, Copy, Debug, PartialEq)]
+#[parameter(rename_all = "snake_case")]
+enum ControlMode {
+    Velocity,
+    Position,
+    #[parameter(rename = "torque")]
+    Effort,
+}
+```
+
+```yaml
+mode: position
+```
+
+The valid values are reported in the descriptor's constraints, so `ros2 param describe` lists
+them, and a value that is not one of them is rejected with a message naming them, over the
+parameter services too. `rename_all` accepts `snake_case`, `kebab-case`, `lowercase`, `UPPERCASE`
+and `SCREAMING_SNAKE_CASE`. Without it, variant names are stored as written.
+
+**`#[parameter(transparent)]`** on a type wrapping a single value gives it that value's
+representation. This is how to attach a unit to a number without giving up anything:
+
+```rust
+#[derive(ParameterVariant, Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
+#[parameter(transparent)]
+struct Meters(f64);
+
+#[derive(ParameterSet)]
+struct Config {
+    // Ranges are in the units of the wrapped type.
+    #[param(default = Meters(1.5), range = 0.0..=10.0)]
+    stopping_distance: Meters,
+}
+```
+
+The wrapped type's validation comes with it: a `Port(u16)` parameter rejects `70000` exactly as a
+`u16` one would.
+
+**`#[parameter(from_str)]`** stores the type as a string, using its `FromStr` and `Display`. The
+`FromStr` error becomes the reason a value was rejected, so it is worth writing well:
+
+```rust
+#[derive(ParameterVariant, Clone, Debug, PartialEq)]
+#[parameter(from_str)]
+struct Hostname(String);
+
+impl FromStr for Hostname {
+    type Err = String;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.is_empty() {
+            Err("a hostname must not be empty".to_string())
+        } else {
+            Ok(Hostname(text.to_string()))
+        }
+    }
+}
+```
+
+If none of those fit, implement `ParameterVariant` by hand and then call
+`declare_parameter_field!` to make the type usable as a field of a set:
 
 ```rust
 declare_parameter_field!(Hostname);
 ```
+
+Structs whose fields are individually meaningful are not values at all. They are groups of
+parameters, and belong in a nested `ParameterSet`.
 
 ## Field options
 
