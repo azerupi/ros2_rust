@@ -137,13 +137,30 @@ impl From<Arc<[Arc<str>]>> for ParameterValue {
 
 /// A trait that describes a value that can be converted into a parameter.
 pub trait ParameterVariant:
-    Into<ParameterValue> + Clone + TryFrom<ParameterValue> + 'static
+    Into<ParameterValue> + Clone + TryFrom<ParameterValue, Error: std::fmt::Display> + 'static
 {
     /// The type used to describe the range of this parameter.
     type Range: Into<ParameterRanges> + Default + Clone;
 
     /// Returns the `ParameterKind` of the implemented type.
     fn kind() -> ParameterKind;
+
+    /// Checks whether `value` can be used for a parameter declared with this type.
+    ///
+    /// A [`ParameterKind`] does not uniquely identify a Rust type: several types can share
+    /// one, and a value of the right kind can still be unrepresentable (an integer that does
+    /// not fit a [`u16`], a string that is not a known enum variant). Parameters are declared
+    /// with a fixed type, so such a value must be rejected when it arrives. Otherwise reading
+    /// the parameter back would panic.
+    ///
+    /// The default implementation defers to [`TryFrom`] and reports its error, which is
+    /// correct for any type whose conversion is total. Override it only to give a better
+    /// message than the conversion error can.
+    fn validate_value(value: &ParameterValue) -> Result<(), String> {
+        Self::try_from(value.clone())
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
 }
 
 impl TryFrom<ParameterValue> for bool {
