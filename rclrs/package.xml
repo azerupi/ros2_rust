@@ -14,6 +14,7 @@
   <author email="esteve@apache.org">Esteve Fernandez</author>
 
   <build_depend>libclang-dev</build_depend>
+  <build_depend>rclrs-macros</build_depend>
   <build_depend>rosidl_runtime_rs</build_depend>
   <depend>rcl</depend>
   <depend>builtin_interfaces</depend>
