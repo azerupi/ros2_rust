@@ -4,6 +4,7 @@ use anyhow::{Error, Result};
 use rosidl_runtime_rs::{seq, BoundedSequence, Message, Sequence};
 
 use rclrs::*;
+use ros_env::*;
 
 fn check_default_values() {
     let msg = rclrs_example_msgs::msg::rmw::VariousTypes::default();

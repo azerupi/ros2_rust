@@ -1,5 +1,6 @@
 use anyhow::{Error, Result};
 use rclrs::*;
+use ros_env::*;
 
 fn main() -> Result<(), Error> {
     let mut executor = Context::default_from_env()?.create_basic_executor();

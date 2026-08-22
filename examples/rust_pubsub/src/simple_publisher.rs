@@ -1,6 +1,6 @@
 use rclrs::*;
+use ros_env::std_msgs::msg::String as StringMsg;
 use std::{thread, time::Duration};
-use std_msgs::msg::String as StringMsg;
 
 struct SimplePublisherNode {
     publisher: Publisher<StringMsg>,

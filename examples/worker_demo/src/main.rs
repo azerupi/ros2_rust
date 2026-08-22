@@ -1,4 +1,5 @@
 use rclrs::*;
+use ros_env::*;
 use std::time::Duration;
 
 fn main() -> Result<(), RclrsError> {
@@ -17,16 +18,12 @@ fn main() -> Result<(), RclrsError> {
 
     // Use this timer-based implementation when timers are available instead
     // of using std::thread::spawn.
-    let _timer = worker.create_timer_repeating(
-        Duration::from_secs(1),
-        move |data: &mut String| {
-            let msg = example_interfaces::msg::String {
-                data: data.clone()
-            };
+    let _timer =
+        worker.create_timer_repeating(Duration::from_secs(1), move |data: &mut String| {
+            let msg = example_interfaces::msg::String { data: data.clone() };
 
             publisher.publish(msg).ok();
-        }
-    )?;
+        })?;
 
     println!(
         "Beginning repeater... \n >> \

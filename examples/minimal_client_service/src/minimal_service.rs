@@ -1,6 +1,6 @@
 use anyhow::{Error, Result};
-use example_interfaces::srv::*;
 use rclrs::*;
+use ros_env::example_interfaces::srv::*;
 
 fn handle_service(request: AddTwoInts_Request, info: ServiceInfo) -> AddTwoInts_Response {
     let timestamp = info

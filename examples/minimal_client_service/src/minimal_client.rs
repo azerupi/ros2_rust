@@ -1,6 +1,6 @@
 use anyhow::{Error, Result};
-use example_interfaces::srv::*;
 use rclrs::*;
+use ros_env::example_interfaces::srv::*;
 
 fn main() -> Result<(), Error> {
     let mut executor = Context::default_from_env()?.create_basic_executor();
