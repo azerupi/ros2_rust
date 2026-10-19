@@ -9,6 +9,10 @@ rust-version.workspace = true
 repository.workspace = true
 keywords = ["ROS", "ROS2", "robotics"]
 
+[lib]
+# Message comments in the generated code are not doctests.
+doctest = false
+
 [dependencies]
 # All the sources we `include!()` depend on this runtime.
 rosidl_runtime_rs.workspace = true
