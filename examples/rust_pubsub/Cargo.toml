@@ -2,6 +2,7 @@
 name = "rust_pubsub"
 version = "0.5.0"
 edition = "2021"
+publish = false
 
 [[bin]]
 name="simple_publisher"
@@ -12,5 +13,5 @@ name="simple_subscriber"
 path="src/simple_subscriber.rs"
 
 [dependencies]
-rclrs = "0.8"
-ros-env = "0.3"
+rclrs = { path = "../../rclrs" }
+ros-env = { path = "../../ros-env" }

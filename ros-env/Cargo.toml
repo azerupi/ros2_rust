@@ -5,13 +5,13 @@ edition = "2021"
 authors = ["Sam Privett <sam@privett.dev>"]
 license = "Apache-2.0"
 description = "Top-level Rust crate to include generated Rust code found in a sourced ROS 2 workspace"
-rust-version = "1.85"
-repository = "https://github.com/ros2-rust/ros-env"
+rust-version.workspace = true
+repository.workspace = true
 keywords = ["ROS", "ROS2", "robotics"]
 
 [dependencies]
 # All the sources we `include!()` depend on this runtime.
-rosidl_runtime_rs = "0.7"
+rosidl_runtime_rs.workspace = true
 
 # Needed for serliazation and deserialization of vendored messages
 serde = { version = "1", optional = true, features = ["derive"] }

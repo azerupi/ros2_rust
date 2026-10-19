@@ -3,6 +3,7 @@ name = "examples_rclrs_minimal_client_service"
 version = "0.5.0"
 authors = ["Esteve Fernandez <esteve@apache.org>"]
 edition = "2021"
+publish = false
 
 [[bin]]
 name = "minimal_client"
@@ -19,5 +20,5 @@ path = "src/minimal_service.rs"
 [dependencies]
 anyhow = {version = "1", features = ["backtrace"]}
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
-rclrs = "0.8"
-ros-env = "0.3"
+rclrs = { path = "../../rclrs" }
+ros-env = { path = "../../ros-env" }

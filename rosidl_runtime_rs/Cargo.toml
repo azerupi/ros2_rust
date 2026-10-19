@@ -6,6 +6,8 @@ authors = ["Esteve Fernandez <esteve@apache.org>", "Nikolai Morin <nnmmgit@gmail
 edition = "2021"
 license = "Apache-2.0"
 description = "Message generation code shared by Rust projects in ROS 2"
+repository.workspace = true
+rust-version.workspace = true
 
 [lib]
 path = "src/lib.rs"
