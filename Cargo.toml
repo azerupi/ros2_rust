@@ -12,6 +12,11 @@ exclude = ["examples/rclrs_example_msgs"]
 default-members = ["ament_rs", "rclrs", "ros-env", "rosidl_runtime_rs"]
 resolver = "3"
 
+# colcon-cargo only finds workspace members, so the excluded message package
+# is listed here. The library crates carry a COLCON_IGNORE.
+[workspace.metadata.colcon]
+additional-packages = ["examples/rclrs_example_msgs"]
+
 [workspace.package]
 repository = "https://github.com/ros2-rust/ros2_rust"
 rust-version = "1.85"

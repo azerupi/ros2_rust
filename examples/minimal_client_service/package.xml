@@ -10,7 +10,6 @@
   <license>Apache License 2.0</license>
 
   <depend>example_interfaces</depend>
-  <depend>rclrs</depend>
 
   <export>
     <build_type>ament_cargo</build_type>

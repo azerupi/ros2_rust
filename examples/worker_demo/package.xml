@@ -11,7 +11,6 @@
   <description>Package containing an example of how to use a worker in rclrs.</description>
   <license>Apache License 2.0</license>
 
-  <depend>rclrs</depend>
   <depend>example_interfaces</depend>
 
   <export>

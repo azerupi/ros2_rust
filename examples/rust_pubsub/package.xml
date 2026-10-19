@@ -5,7 +5,6 @@
   <maintainer email="user@todo.todo">user</maintainer>
   <license>TODO: License declaration.</license>
 
-  <depend>rclrs</depend>
   <depend>std_msgs</depend>
 
   <export>
