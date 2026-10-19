@@ -219,36 +219,39 @@ pub fn register_package(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use assert_fs::prelude::*;
     use itertools::Itertools;
 
     struct AmentIndexTestFixture<'a> {
         manifest: Vec<(&'a str, Vec<&'a str>)>,
-        pub fs: assert_fs::TempDir,
+        pub fs: tempfile::TempDir,
     }
 
     impl<'a> AmentIndexTestFixture<'a> {
         pub fn new(manifest: Vec<(&'a str, Vec<&'a str>)>) -> Self {
-            let fs = assert_fs::TempDir::new().unwrap();
+            let fs = tempfile::TempDir::new().unwrap();
 
             for (package, paths) in &manifest {
                 for path in paths {
-                    fs.child(path)
-                        .child("share")
-                        .child("ament_index")
-                        .child("resource_index")
-                        .child("packages")
-                        .create_dir_all()
-                        .unwrap();
+                    std::fs::create_dir_all(
+                        fs.path()
+                            .join(path)
+                            .join("share")
+                            .join("ament_index")
+                            .join("resource_index")
+                            .join("packages"),
+                    )
+                    .unwrap();
 
-                    fs.child(path)
-                        .child("share")
-                        .child("ament_index")
-                        .child("resource_index")
-                        .child("packages")
-                        .child(package)
-                        .touch()
-                        .unwrap();
+                    std::fs::File::create(
+                        fs.path()
+                            .join(path)
+                            .join("share")
+                            .join("ament_index")
+                            .join("resource_index")
+                            .join("packages")
+                            .join(package),
+                    )
+                    .unwrap();
                 }
             }
 
@@ -364,8 +367,12 @@ mod tests {
             vec![
                 fixture
                     .fs
+                    .path()
                     .join("my/workspace/install/common_interfaces/share/common_interfaces"),
-                fixture.fs.join("opt/ros/rolling/share/common_interfaces"),
+                fixture
+                    .fs
+                    .path()
+                    .join("opt/ros/rolling/share/common_interfaces"),
             ]
         );
     }
@@ -390,8 +397,11 @@ mod tests {
         assert_eq!(
             common_interfaces,
             vec![
-                fixture.fs.join("my/workspace/install/common_interfaces"),
-                fixture.fs.join("opt/ros/rolling"),
+                fixture
+                    .fs
+                    .path()
+                    .join("my/workspace/install/common_interfaces"),
+                fixture.fs.path().join("opt/ros/rolling"),
             ]
         );
     }
@@ -417,16 +427,18 @@ mod tests {
 
     #[test]
     fn resources_ignore_directories() {
-        let fs = assert_fs::TempDir::new().unwrap();
+        let fs = tempfile::TempDir::new().unwrap();
 
-        fs.child("prefix")
-            .child("share")
-            .child("ament_index")
-            .child("resource_index")
-            .child("packages")
-            .child("not_a_package")
-            .create_dir_all()
-            .unwrap();
+        std::fs::create_dir_all(
+            fs.path()
+                .join("prefix")
+                .join("share")
+                .join("ament_index")
+                .join("resource_index")
+                .join("packages")
+                .join("not_a_package"),
+        )
+        .unwrap();
 
         let prefixes = vec![fs.path().join("prefix")];
 
@@ -436,24 +448,28 @@ mod tests {
 
     #[test]
     fn resources_support_arbitrary_resource_types() {
-        let fs = assert_fs::TempDir::new().unwrap();
+        let fs = tempfile::TempDir::new().unwrap();
 
-        fs.child("prefix")
-            .child("share")
-            .child("ament_index")
-            .child("resource_index")
-            .child("plugins")
-            .create_dir_all()
-            .unwrap();
+        std::fs::create_dir_all(
+            fs.path()
+                .join("prefix")
+                .join("share")
+                .join("ament_index")
+                .join("resource_index")
+                .join("plugins"),
+        )
+        .unwrap();
 
-        fs.child("prefix")
-            .child("share")
-            .child("ament_index")
-            .child("resource_index")
-            .child("plugins")
-            .child("my_plugin")
-            .touch()
-            .unwrap();
+        std::fs::File::create(
+            fs.path()
+                .join("prefix")
+                .join("share")
+                .join("ament_index")
+                .join("resource_index")
+                .join("plugins")
+                .join("my_plugin"),
+        )
+        .unwrap();
 
         let prefixes = vec![fs.path().join("prefix")];
 
@@ -469,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_register_resource() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp = assert_fs::TempDir::new()?;
+        let tmp = tempfile::TempDir::new()?;
         let install_base = tmp.path();
 
         register_resource(install_base, "packages", "test_package", "")?;
@@ -485,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_register_resource_with_content() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp = assert_fs::TempDir::new()?;
+        let tmp = tempfile::TempDir::new()?;
         let install_base = tmp.path();
 
         register_resource(
@@ -507,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_register_package() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp = assert_fs::TempDir::new()?;
+        let tmp = tempfile::TempDir::new()?;
         let install_base = tmp.path();
 
         register_package(install_base, "test_package")?;

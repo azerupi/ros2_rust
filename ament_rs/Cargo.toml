@@ -17,5 +17,5 @@ categories = [
 ]
 
 [dev-dependencies]
-assert_fs = "1"
 itertools = "0.15"
+tempfile = "3"
