@@ -1,9 +1,15 @@
+// Collecting `format!` output reads best for the generated module tree. Only
+// older clippy versions warn about it by default.
+#![allow(clippy::format_collect)]
+
 use ament_rs::{search_paths::get_search_paths, AMENT_PREFIX_PATH_ENV_VAR};
 use cargo_toml::Manifest;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::{env, fs};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn is_marked_for_inclusion(path: &PathBuf) -> bool {
     Manifest::from_path(path)

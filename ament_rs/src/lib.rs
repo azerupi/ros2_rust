@@ -26,12 +26,14 @@
 //! ```
 //!
 //! For more information:
-//! - Design doc: https://github.com/ament/ament_cmake/blob/2366f15479e37d552d4e225f09ccef1c6ccc8c4e/ament_cmake_core/doc/resource_index.md
+//! - Design doc: <https://github.com/ament/ament_cmake/blob/2366f15479e37d552d4e225f09ccef1c6ccc8c4e/ament_cmake_core/doc/resource_index.md>
 
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 
 /// This constant defines the name of the environment variable containing the list of ament resource index prefixes, which is `AMENT_PREFIX_PATH`
 pub const AMENT_PREFIX_PATH_ENV_VAR: &str = "AMENT_PREFIX_PATH";
@@ -304,15 +306,15 @@ mod tests {
 
         let shared_package = packages.get("shared_package").unwrap();
         assert_eq!(
-            shared_package[0].iter().last().unwrap().to_str(),
+            shared_package[0].iter().next_back().unwrap().to_str(),
             Some("second_prefix")
         );
         assert_eq!(
-            shared_package[1].iter().last().unwrap().to_str(),
+            shared_package[1].iter().next_back().unwrap().to_str(),
             Some("first_prefix")
         );
         assert_eq!(
-            shared_package[2].iter().last().unwrap().to_str(),
+            shared_package[2].iter().next_back().unwrap().to_str(),
             Some("third_prefix")
         );
     }
