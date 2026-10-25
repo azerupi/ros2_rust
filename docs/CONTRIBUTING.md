@@ -17,6 +17,7 @@ A scheduled workflow opens a pull request to move the pin whenever `rosidl_rust`
 
 For a change that needs both a generator and a runtime change, open the `rosidl_rust` pull request first and point `version` in `ros2_rust_generator.repos` at the commit of its branch, so that CI tests the pair.
 If that branch lives on your fork, point `url` at your fork as well.
+To build and test the pair locally, run `docker/overlay.sh` (see [Importing repositories](building.md#importing-repositories)) and build the workspace with its overlay sourced.
 Once the generator change is merged, point the pin back at `ros2-rust/rosidl_rust` and at the merged commit. CI refuses a pin that is not on `rosidl_rust` `main`.
 
 ## Coding guidelines

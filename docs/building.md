@@ -53,7 +53,7 @@ Build the Docker image with
 
 ```shell
 # Make sure to run this in the workspace directory
-# ROS_DISTRO can be humble|rolling
+# ROS_DISTRO can be humble|jazzy|kilted|lyrical|rolling
 docker build -f src/ros2_rust/Dockerfile --build-arg "ROS_DISTRO=humble" -t ros2_rust_dev .
 ```
 
@@ -65,23 +65,23 @@ docker run --rm -it --volume $(pwd):/workspace ros2_rust_dev /bin/bash
 ```
 
 As you can see, this maps the workspace directory to `/workspace` inside the container. So, if you're using Docker, that is now the "workspace directory".
+The image already contains the [overlay](#importing-repositories) with the interface packages and the pinned code generator, and sources it for you.
 
 
 ### Importing repositories
 
 ROS distributions ship Rust bindings for their interface packages, built with the released `rosidl_rust` code generator.
 `rclrs` on `main` sometimes needs a newer generator than that. In that case, build the interface packages and the generator from source in a separate overlay workspace, and source it before you build your own workspace.
-The `ros2_rust_<distro>.repos` files of `ros2_rust` list them for each distribution, and `ros2_rust_generator.repos` pins the generator to the commit that CI tests `rclrs` with:
+The `ros2_rust_<distro>.repos` files of `ros2_rust` list them for each distribution, and `ros2_rust_generator.repos` pins the generator to the commit that CI tests `rclrs` with.
+`docker/overlay.sh` builds the same overlay as CI:
 
 ```shell
-# With the ROS 2 installation sourced, in a new directory next to your workspace directory
-mkdir -p overlay/src && cd overlay
-vcs import src < ../workspace/src/ros2_rust/ros2_rust_humble.repos
-vcs import src < ../workspace/src/ros2_rust/ros2_rust_generator.repos
-colcon build
+# With the ROS 2 installation sourced, from your workspace directory
+src/ros2_rust/docker/overlay.sh ../overlay
+. ../overlay/install/setup.sh
 ```
 
-This uses the [`vcs` tool](https://github.com/dirk-thomas/vcstool), which is preinstalled in the Docker image.
+It imports the repositories for `$ROS_DISTRO` with the [`vcs` tool](https://github.com/dirk-thomas/vcstool) and builds them with colcon. Pass `--rosdep` to install their dependencies first. To update the overlay later, remove its directory and run the script again.
 
 `ros-env` picks the first provider of an interface package in `$AMENT_PREFIX_PATH`, so once the overlay is sourced, its bindings take precedence over the ones in `/opt/ros`.
 Don't import these repositories into the `src` directory of your workspace instead. colcon only puts a package on the build environment of the packages that depend on it, and Rust packages don't list the interface packages that `rclrs` itself uses, so they would still get the bindings from `/opt/ros`.

@@ -42,7 +42,7 @@ Since the client library is still rapidly evolving, there are no stability guara
 | [`ros-env`](ros-env) | Re-exports the generated interface packages of the sourced workspace, published as [`ros-env`](https://crates.io/crates/ros-env) |
 | [`ament_rs`](ament_rs) | Queries the ament resource index, published as [`ament_rs`](https://crates.io/crates/ament_rs) |
 | [`examples`](examples) | Example ROS packages that use `rclrs` |
-| [`docker`](docker) | A development container |
+| [`docker`](docker) | A development container, and a script that builds the interface packages and the code generator from source |
 | `ros2_rust_*.repos` | `vcs` files for building the interface packages and the code generator from source |
 
 All crates form a single cargo workspace. The libraries are built with cargo only and are hidden from colcon, which only sees the examples.
